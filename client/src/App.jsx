@@ -1,3 +1,4 @@
+const API_URL = import.meta.env.VITE_API_URL || `${API_URL}`;
 import jsPDF from "jspdf";
 import JSZip from "jszip";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -148,7 +149,7 @@ function App() {
 
     for (const modelValue of queue) {
       try {
-        const res = await fetch("http://localhost:5000/chat", {
+        const res = await fetch(`${API_URL}/chat`, {
           method: "POST",
           signal,
           headers: {
@@ -225,7 +226,7 @@ function App() {
       setIsSpeaking(true);
       showToast("Generating voice...");
 
-      const res = await fetch("http://localhost:5000/tts", {
+      const res = await fetch(`${API_URL}/tts`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -415,7 +416,7 @@ What would you like to build today?`,
 
       try {
         const response = await fetch(
-          `http://localhost:5000/project-memory?userEmail=${encodeURIComponent(userEmail)}`
+         `${API_URL}/project-memory?userEmail=${encodeURIComponent(userEmail)}`
         );
 
         if (response.ok) {
@@ -469,7 +470,7 @@ What would you like to build today?`,
     clearTimeout(projectMemorySaveTimerRef.current);
     projectMemorySaveTimerRef.current = setTimeout(async () => {
       try {
-        await fetch("http://localhost:5000/project-memory/save", {
+        await fetch(`${API_URL}/project-memory/save`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1385,7 +1386,7 @@ setTimeout(function(){
       showToast(`Self-healing preview · Attempt ${previousAttempts + 1}/2`);
 
       try {
-        const response = await fetch("http://localhost:5000/runtime-self-heal", {
+        const response = await fetch(`${API_URL}/runtime-self-heal`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -3703,7 +3704,7 @@ window.addEventListener("unhandledrejection", function(event) {
     const formData = new FormData();
     formData.append("file", file);
 
-    const res = await fetch("http://localhost:5000/read-document", {
+    const res = await fetch(`${API_URL}/read-document`, {
       method: "POST",
       body: formData,
     });
@@ -3929,7 +3930,7 @@ window.addEventListener("unhandledrejection", function(event) {
       const userEmail = getUserEmail();
 
       const res = await fetch(
-        `http://localhost:5000/memory?userEmail=${encodeURIComponent(userEmail)}`
+        `${API_URL}/memory?userEmail=${encodeURIComponent(userEmail)}`
       );
 
       const data = await res.json();
@@ -3951,7 +3952,7 @@ window.addEventListener("unhandledrejection", function(event) {
     try {
       const userEmail = getUserEmail();
 
-      const res = await fetch("http://localhost:5000/memory/forget", {
+      const res = await fetch(`${API_URL}/memory/forget`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -3980,7 +3981,7 @@ window.addEventListener("unhandledrejection", function(event) {
     try {
       const userEmail = getUserEmail();
 
-      const res = await fetch("http://localhost:5000/memory/forget", {
+      const res = await fetch(`${API_URL}/memory/forget`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -4310,7 +4311,7 @@ Today is **${date}**.`;
 
     const getWeather = async (location) => {
       try {
-        return await fetchJsonSafely("http://localhost:5000/weather", {
+        return await fetchJsonSafely(`${API_URL}/weather`, {
           method: "POST",
           signal: abortControllerRef.current?.signal,
           headers: { "Content-Type": "application/json" },
@@ -4362,7 +4363,7 @@ Today is **${date}**.`;
 
     if (wantsNews) {
       try {
-        const newsData = await fetchJsonSafely("http://localhost:5000/web-search", {
+        const newsData = await fetchJsonSafely(`${API_URL}/web-search`, {
           method: "POST",
           signal: abortControllerRef.current?.signal,
           headers: { "Content-Type": "application/json" },
@@ -4401,8 +4402,8 @@ Today is **${date}**.`;
 
   const fetchQuickInfoAnswer = async (query = "") => {
     const endpoints = [
-      "http://localhost:5000/quick-info",
-      "http://localhost:5000/api/quick-info",
+      `${API_URL}/quick-info`,
+      `${API_URL}/api/quick-info`,
     ];
 
     let lastError = null;
@@ -4592,7 +4593,7 @@ Today is **${date}**.`;
   const resolveMasterRoute = async (text = "", context = {}, explicitTask = "") => {
     const localRoute = getTaskTypeForPrompt(text);
     try {
-      const response = await fetch("http://localhost:5000/orchestrate", {
+      const response = await fetch(`${API_URL}/orchestrate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: text, context, explicitTask }),
@@ -4684,7 +4685,7 @@ Today is **${date}**.`;
     if (!snapshotFiles || !Object.keys(snapshotFiles).length) return null;
 
     try {
-      const response = await fetch("http://localhost:5000/project-memory/snapshot", {
+      const response = await fetch(`${API_URL}/project-memory/snapshot`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -4788,7 +4789,7 @@ Preview has been refreshed with the updated project files.`;
 
     setLoading(true);
     try {
-      const response = await fetch("http://localhost:5000/software-engineer/decision", {
+      const response = await fetch(`${API_URL}/software-engineer/decision`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -4963,7 +4964,7 @@ ${selectedImages.length > 1 ? "\nNote: Multiple images were uploaded. Analyze al
       setLoading(true);
 
       try {
-        const response = await fetch("http://localhost:5000/software-engineer/plan", {
+        const response = await fetch(`${API_URL}/software-engineer/plan`, {
           method: "POST",
           signal: abortControllerRef.current?.signal,
           headers: { "Content-Type": "application/json" },
@@ -5050,7 +5051,7 @@ I applied a local blur preview to the uploaded image. For exact subject-preserve
           return;
         }
 
-        const editRes = await fetch("http://localhost:5000/image-edit", {
+        const editRes = await fetch(`${API_URL}/image-edit`, {
           method: "POST",
           signal: abortControllerRef.current?.signal,
           headers: {
@@ -5118,7 +5119,7 @@ Request: **${prompt}**\n\n${editData.note ? editData.note : "Edited image is rea
       console.log("REMOVE BACKGROUND MODE TRIGGERED");
 
       try {
-        const removeBgRes = await fetch("http://localhost:5000/remove-background", {
+        const removeBgRes = await fetch(`${API_URL}/remove-background`, {
           method: "POST",
           signal: abortControllerRef.current?.signal,
           headers: {
@@ -5195,7 +5196,7 @@ Your image background has been removed successfully.`,
       try {
         const prompt = cleanImagePrompt(finalInput);
 
-        const imageRes = await fetch("http://localhost:5000/generate-image", {
+        const imageRes = await fetch(`${API_URL}/generate-image`, {
           method: "POST",
           signal: abortControllerRef.current?.signal,
           headers: {
@@ -5295,7 +5296,7 @@ Prompt: **${prompt}**`,
             }
           : null;
 
-        const healRes = await fetch("http://localhost:5000/runtime-self-heal", {
+        const healRes = await fetch(`${API_URL}/runtime-self-heal`, {
           method: "POST",
           signal: abortControllerRef.current.signal,
           headers: { "Content-Type": "application/json" },
@@ -5408,13 +5409,13 @@ The request stayed on the Runtime Self-Healing route and was not sent to Project
         let data;
         if (isRecallOnly) {
           data = await fetchJsonSafely(
-            `http://localhost:5000/project-memory?userEmail=${encodeURIComponent(getUserEmail())}`,
+           `${API_URL}/project-memory?userEmail=${encodeURIComponent(getUserEmail())}`,
             { signal: abortControllerRef.current.signal },
             "Project memory"
           );
         } else {
           data = await fetchJsonSafely(
-            "http://localhost:5000/project-memory/capture",
+            `${API_URL}/project-memory/capture`,
             {
               method: "POST",
               signal: abortControllerRef.current.signal,
@@ -5562,7 +5563,7 @@ The analyzer result and the exact project files are now synchronized in Project 
       try {
         const location = extractWeatherLocation(finalInput);
 
-        const weatherRes = await fetch("http://localhost:5000/weather", {
+        const weatherRes = await fetch(`${API_URL}/weather`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -5626,7 +5627,7 @@ Based on live weather data.`,
       try {
         showToast(finalInput.toLowerCase().includes("fix") || finalInput.toLowerCase().includes("edit") ? "AI Coding Agent is editing project..." : "AI Coding Agent is analyzing project...");
 
-        const agentRes = await fetch("http://localhost:5000/coding-agent", {
+        const agentRes = await fetch(`${API_URL}/coding-agent`, {
           method: "POST",
           signal: abortControllerRef.current.signal,
           headers: {
@@ -5730,7 +5731,7 @@ Based on live weather data.`,
 
         const value = rememberMatch[2].trim();
 
-        const res = await fetch("http://localhost:5000/memory/save", {
+        const res = await fetch(`${API_URL}/memory/save`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -5789,8 +5790,8 @@ Based on live weather data.`,
 
         const searchQuery = cleanSearchQuery(finalInput);
         const searchEndpoint = isAgentRequest(finalInput)
-          ? "http://localhost:5000/agent-research"
-          : "http://localhost:5000/web-search";
+          ? `${API_URL}/agent-research`
+          : `${API_URL}/web-search`;
         const searchRes = await fetch(searchEndpoint, {
           method: "POST",
           signal: abortControllerRef.current.signal,
@@ -5897,7 +5898,7 @@ Rules:
 
             setMessages([...newMessages, aiMsg]);
 
-            const res = await fetch("http://localhost:5000/chat-stream", {
+            const res = await fetch(`${API_URL}/chat-stream`, {
               method: "POST",
               signal: abortControllerRef.current.signal,
               headers: {
