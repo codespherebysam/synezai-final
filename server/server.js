@@ -5,6 +5,7 @@ const path = require("path");
 const multer = require("multer");
 const pdfParse = require("pdf-parse");
 const mammoth = require("mammoth");
+const { generateHuggingFaceImage } = require("./lib/huggingFaceImage");
 require("dotenv").config();
 
 const app = express();
@@ -155,6 +156,10 @@ General Rules:
 3. Do not say you cannot read uploaded PDF/DOCX if document text is present in the user message.
 4. For document comparison, compare the extracted text already present in the prompt.
 5. For website/code requests, return valid preview-ready code blocks.
+6. Sound natural and helpful, not like a template or support bot.
+7. For simple questions, use short conversational paragraphs instead of unnecessary headings.
+8. Use lists, tables, bold text, and emojis only when they genuinely make the answer clearer.
+9. Match the user's tone while keeping the answer accurate and respectful.
 `;
 
 
@@ -201,7 +206,7 @@ function isImageGenerationRequest(text = "") {
   ].some((word) => t.includes(word));
 }
 
-async function callGroq(model, safeMessages, systemPrompt) {
+async function callGroq(model, safeMessages, systemPrompt, options = {}) {
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -211,8 +216,8 @@ async function callGroq(model, safeMessages, systemPrompt) {
     body: JSON.stringify({
       model,
       messages: [{ role: "system", content: systemPrompt }, ...safeMessages],
-      temperature: 0.7,
-      max_tokens: 2048,
+      temperature: options.temperature ?? 0.7,
+      max_tokens: options.maxTokens || 2048,
     }),
   });
 
@@ -225,7 +230,7 @@ async function callGroq(model, safeMessages, systemPrompt) {
   return data?.choices?.[0]?.message?.content || "No response from Groq.";
 }
 
-async function callOpenRouter(model, safeMessages, systemPrompt) {
+async function callOpenRouter(model, safeMessages, systemPrompt, options = {}) {
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -237,8 +242,8 @@ async function callOpenRouter(model, safeMessages, systemPrompt) {
     body: JSON.stringify({
       model,
       messages: [{ role: "system", content: systemPrompt }, ...safeMessages],
-      temperature: 0.7,
-      max_tokens: 2048,
+      temperature: options.temperature ?? 0.7,
+      max_tokens: options.maxTokens || 2048,
     }),
   });
 
@@ -263,7 +268,7 @@ function hasImagePayload(imageData = null) {
   return normalizeImageDataList(imageData).length > 0;
 }
 
-async function callGemini(model, safeMessages, systemPrompt, imageData = null) {
+async function callGemini(model, safeMessages, systemPrompt, imageData = null, options = {}) {
   const conversationText = safeMessages
     .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
     .join("\n\n");
@@ -300,8 +305,8 @@ ${conversationText}`,
       body: JSON.stringify({
         contents: [{ role: "user", parts }],
         generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 2048,
+          temperature: options.temperature ?? 0.7,
+          maxOutputTokens: options.maxTokens || 2048,
         },
       }),
     }
@@ -821,88 +826,36 @@ app.post("/weather", async (req, res) => {
 
 app.post("/generate-image", async (req, res) => {
   try {
-    const { prompt } = req.body;
+    const prompt = String(req.body?.prompt || "").trim();
 
-    if (!prompt || !prompt.trim()) {
+    if (!prompt) {
       return res.status(400).json({
-        error: "Image prompt required",
+        error: "Describe the image you want to generate.",
+        code: "IMAGE_PROMPT_REQUIRED",
       });
     }
 
-    if (!process.env.HF_API_KEY) {
-      return res.status(500).json({
-        error: "HF_API_KEY missing in .env",
-      });
-    }
-
-    const cleanPrompt = prompt.trim();
-
-    const model =
-      process.env.HF_IMAGE_MODEL ||
-      "stabilityai/stable-diffusion-xl-base-1.0";
-
-    const response = await fetch(
-      `https://router.huggingface.co/hf-inference/models/${model}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.HF_API_KEY}`,
-          "Content-Type": "application/json",
-          Accept: "image/png",
-        },
-        body: JSON.stringify({
-          inputs: cleanPrompt,
-          parameters: {
-            negative_prompt:
-              "blurry, low quality, distorted, deformed, watermark, text",
-          },
-          options: {
-            wait_for_model: true,
-          },
-        }),
-      }
-    );
-
-    const contentType = response.headers.get("content-type") || "";
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.log("HF IMAGE ERROR:", errorText);
-
-      return res.status(response.status).json({
-        error: errorText || "Hugging Face image generation failed",
-      });
-    }
-
-    if (!contentType.startsWith("image/")) {
-      const text = await response.text();
-      console.log("HF NON IMAGE RESPONSE:", text);
-
-      return res.status(500).json({
-        error: "Hugging Face did not return an image. Try again later.",
-      });
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    const mimeType = contentType.split(";")[0] || "image/png";
-    const imageDataUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
+    const generated = await generateHuggingFaceImage({ prompt });
+    const imageDataUrl = generated.buffer
+      ? `data:${generated.mimeType};base64,${generated.buffer.toString("base64")}`
+      : undefined;
 
     res.json({
       success: true,
-      prompt: cleanPrompt,
+      prompt,
       imageDataUrl,
-      mimeType,
+      imageUrl: generated.imageUrl,
+      mimeType: generated.mimeType,
       provider: "Hugging Face",
-      model,
+      model: generated.model,
       sourceUrl: "https://huggingface.co/settings/tokens",
     });
   } catch (error) {
-    console.log("IMAGE GENERATION ERROR:", error.message);
-
-    res.status(500).json({
-      error: error.message,
+    console.error("IMAGE GENERATION ERROR:", error.code || error.message);
+    res.status(error.status || 500).json({
+      error: error.message || "Image generation failed.",
+      code: error.code || "IMAGE_GENERATION_FAILED",
+      details: error.details || undefined,
     });
   }
 });
@@ -1200,19 +1153,19 @@ function isRetryableAIError(error) {
   );
 }
 
-async function callModelByProvider(item, safeMessages, systemPrompt, imageData = null) {
+async function callModelByProvider(item, safeMessages, systemPrompt, imageData = null, options = {}) {
   if (item.provider === "Groq") {
-    return await callGroq(item.model, safeMessages, systemPrompt);
+    return await callGroq(item.model, safeMessages, systemPrompt, options);
   }
 
   if (item.provider === "Gemini") {
-    return await callGemini(item.model, safeMessages, systemPrompt, imageData);
+    return await callGemini(item.model, safeMessages, systemPrompt, imageData, options);
   }
 
-  return await callOpenRouter(item.model, safeMessages, systemPrompt);
+  return await callOpenRouter(item.model, safeMessages, systemPrompt, options);
 }
 
-async function generateWithFallback(selectedModel, safeMessages, systemPrompt, imageData = null) {
+async function generateWithFallback(selectedModel, safeMessages, systemPrompt, imageData = null, options = {}) {
   const plan = buildFallbackPlan(selectedModel, hasImagePayload(imageData));
   const tried = [];
   let lastError = null;
@@ -1220,7 +1173,7 @@ async function generateWithFallback(selectedModel, safeMessages, systemPrompt, i
   for (const item of plan) {
     try {
       console.log(`AI TRY: ${item.provider} -> ${item.model}`);
-      const reply = await callModelByProvider(item, safeMessages, systemPrompt, imageData);
+      const reply = await callModelByProvider(item, safeMessages, systemPrompt, imageData, options);
 
       return {
         reply,
@@ -1576,8 +1529,8 @@ function buildTaskAwareFallbackPlan(selectedModel = "", taskType = "chat", hasIm
     add("Gemini", "gemini-2.5-flash");
   }
 
-  if (taskType === "website") {
-    // Best quality first. 8B should be emergency-only for premium website generation.
+  if (taskType === "website" || taskType === "project") {
+    // Best quality first. 8B should be emergency-only for code generation.
     add("Groq", "llama-3.3-70b-versatile");
     add("Gemini", "gemini-2.5-flash");
 
@@ -1604,7 +1557,14 @@ function buildTaskAwareFallbackPlan(selectedModel = "", taskType = "chat", hasIm
   return buildFallbackPlan(selectedModel, hasImage);
 }
 
-async function generateWithTaskAwareFallback(selectedModel, safeMessages, systemPrompt, imageData = null, taskType = "chat") {
+async function generateWithTaskAwareFallback(
+  selectedModel,
+  safeMessages,
+  systemPrompt,
+  imageData = null,
+  taskType = "chat",
+  options = {}
+) {
   const plan = buildTaskAwareFallbackPlan(selectedModel, taskType, hasImagePayload(imageData));
   const tried = [];
   let lastError = null;
@@ -1612,7 +1572,7 @@ async function generateWithTaskAwareFallback(selectedModel, safeMessages, system
   for (const item of plan) {
     try {
       console.log(`AI TRY [${taskType}]: ${item.provider} -> ${item.model}`);
-      const reply = await callModelByProvider(item, safeMessages, systemPrompt, imageData);
+      const reply = await callModelByProvider(item, safeMessages, systemPrompt, imageData, options);
 
       return {
         reply,
@@ -2801,6 +2761,11 @@ function isProjectBuildRequest(text = "") {
   // Known app/clone keywords are always project mode.
   if (/(netflix|spotify|youtube|instagram|whatsapp|uber|zomato|amazon|flipkart|twitter|x clone|facebook|discord|telegram|notion|trello|slack).*clone/i.test(t)) return true;
   if (/(clone).*(netflix|spotify|youtube|instagram|whatsapp|uber|zomato|amazon|flipkart|twitter|facebook|discord|telegram|notion|trello|slack)/i.test(t)) return true;
+  if (
+    /\b(react|vite)\b/i.test(t) &&
+    /\b(app|application|project|website|dashboard|code|components?)\b/i.test(t) &&
+    /\b(build|create|make|generate|develop|code|want|need|give|show|banao|bnao|bnado)\b/i.test(t)
+  ) return true;
 
   const buildIntent = /(build|create|make|generate|develop|code|banao|bnao|bnado)/i.test(t);
   const projectWords =
@@ -3207,16 +3172,125 @@ Reply **GENERATE** and I will create the first version of this project as multi-
 
 
 function isGenerateProjectRequest(text = "") {
-  return /^(generate|generate files|generate project|create files|start generation|build files)$/i.test(
-    String(text || "").trim()
+  const value = String(text || "").trim();
+  return (
+    /^(generate|generate files|generate project|create files|start generation|build files|generate code)$/i.test(value) ||
+    (
+      /\b(generate|create|build|make|want|need|give|show)\b/i.test(value) &&
+      /\b(react|vite)\b/i.test(value) &&
+      /\b(app|application|project|website|dashboard|code|components?)\b/i.test(value)
+    )
   );
 }
 
+function getOriginalProjectRequest(messages = [], currentPrompt = "") {
+  if (!/^(generate|generate files|generate project|create files|start generation|build files|generate code)$/i.test(
+    String(currentPrompt || "").trim()
+  )) {
+    return currentPrompt;
+  }
 
-function isGenerateProjectRequest(text = "") {
-  return /^(generate|generate files|generate project|create files|start generation|build files)$/i.test(
-    String(text || "").trim()
+  return (
+    [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "user" &&
+          message.content !== currentPrompt &&
+          isProjectBuildRequest(message.content)
+      )?.content || ""
   );
+}
+
+function composeReactProjectPrompt(userPrompt = "") {
+  return `Build a complete React + Vite project for this request:
+
+${userPrompt}
+
+Return runnable multi-file code, not an architecture plan and not a vanilla HTML/CSS/JavaScript website.
+
+Required files:
+- package.json with pinned compatible versions
+- index.html
+- src/main.jsx
+- src/App.jsx
+- src/styles.css
+- at least three meaningful files under src/components/
+- add pages, data, hooks, or utilities when the request needs them
+
+Output every file exactly like this:
+=== FILE: src/components/Example.jsx ===
+\`\`\`jsx
+complete file contents
+\`\`\`
+
+Rules:
+- App.jsx must compose imported components; do not put the whole UI in one component.
+- All imports and referenced files must exist.
+- Use realistic content tailored to the request.
+- Include responsive, accessible UI and working interactions.
+- Do not use "latest" dependency versions.
+- Do not omit code with placeholders such as "rest of code here".
+- Do not include explanations before, between, or after the file blocks.`;
+}
+
+function isCompleteReactProjectOutput(content = "") {
+  const text = String(content || "");
+  const componentFiles = text.match(/===\s*FILE:\s*src\/components\/[\w./-]+\.jsx/gi) || [];
+
+  return (
+    /===\s*FILE:\s*package\.json/i.test(text) &&
+    /===\s*FILE:\s*index\.html/i.test(text) &&
+    /===\s*FILE:\s*src\/main\.jsx/i.test(text) &&
+    /===\s*FILE:\s*src\/App\.jsx/i.test(text) &&
+    /===\s*FILE:\s*src\/[\w./-]+\.css/i.test(text) &&
+    componentFiles.length >= 3
+  );
+}
+
+async function generateReactProject({
+  selectedModel,
+  userPrompt,
+  userName,
+  userEmail,
+}) {
+  const systemPrompt = `${createSystemPrompt(userName, userEmail)}
+
+You are now in React Project Generator mode. Follow the requested file format exactly.`;
+  const projectPrompt = composeReactProjectPrompt(userPrompt);
+  let result = await generateWithTaskAwareFallback(
+    selectedModel,
+    [{ role: "user", content: projectPrompt }],
+    systemPrompt,
+    null,
+    "project",
+    { maxTokens: 8192, temperature: 0.45 }
+  );
+
+  if (!isCompleteReactProjectOutput(result.reply)) {
+    result = await generateWithTaskAwareFallback(
+      selectedModel,
+      [
+        { role: "user", content: projectPrompt },
+        { role: "assistant", content: result.reply },
+        {
+          role: "user",
+          content:
+            "Regenerate the entire answer. It failed validation because required React/Vite files or component files were missing. Return only complete === FILE: path === blocks.",
+        },
+      ],
+      systemPrompt,
+      null,
+      "project",
+      { maxTokens: 8192, temperature: 0.3 }
+    );
+  }
+
+  if (!isCompleteReactProjectOutput(result.reply)) {
+    throw new Error("The selected model did not return a complete component-based React project. Please retry.");
+  }
+
+  return result;
 }
 
 function buildStarterProjectFilesResponse(userPrompt = "") {
@@ -4619,10 +4693,32 @@ app.post("/chat", async (req, res) => {
     }
 
     if (isGenerateProjectRequest(lastUserMessage)) {
+      const originalProjectRequest = getOriginalProjectRequest(safeMessages, lastUserMessage);
+      if (!originalProjectRequest) {
+        return res.status(400).json({
+          reply: "Tell me which React project you want to build, then send GENERATE.",
+          provider: "SYNEZ AI",
+          model: "Project Generator",
+          task: "project-generate",
+          orchestrator: orchestration,
+        });
+      }
+
+      const projectResult = await generateReactProject({
+        selectedModel,
+        userPrompt: originalProjectRequest,
+        userName: userName || "User",
+        userEmail: userEmail || "guest",
+      });
+
       return res.json({
-        reply: buildStarterProjectFilesResponse(lastUserMessage),
-        provider: "SYNEZ AI",
-        model: "Deterministic Project Generator",
+        reply: projectResult.reply,
+        provider: projectResult.fallbackUsed
+          ? `${projectResult.provider} Auto Fallback`
+          : projectResult.provider,
+        model: projectResult.model,
+        fallbackUsed: projectResult.fallbackUsed,
+        triedModels: projectResult.triedModels,
         task: "project-generate",
         orchestrator: orchestration,
       });
@@ -5747,12 +5843,23 @@ app.get("/software-engineer/history", (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(`SYNEZ AI server running on port ${PORT}`);
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`SYNEZ AI server running on port ${PORT}`);
 
-  if (SERPER_KEYS.length > 0) {
-    console.log(`SERPER keys loaded ✅ (${SERPER_KEYS.length})`);
-  } else {
-    console.log("SERPER API key missing ❌");
-  }
-});
+    if (SERPER_KEYS.length > 0) {
+      console.log(`SERPER keys loaded ✅ (${SERPER_KEYS.length})`);
+    } else {
+      console.log("SERPER API key missing ❌");
+    }
+  });
+}
+
+module.exports = {
+  app,
+  composeReactProjectPrompt,
+  generateReactProject,
+  getOriginalProjectRequest,
+  isCompleteReactProjectOutput,
+  isGenerateProjectRequest,
+};

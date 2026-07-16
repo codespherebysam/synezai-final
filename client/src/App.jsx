@@ -1,14 +1,15 @@
-const API_URL = import.meta.env.VITE_API_URL || `${API_URL}`;
-import jsPDF from "jspdf";
-import JSZip from "jszip";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { PrismAsyncLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { signOut } from "firebase/auth";
-import remarkGfm from "remark-gfm";
 import { auth, db } from "./firebase";
+import { API_URL } from "./config/api";
+import Sidebar from "./components/Sidebar";
+import Topbar from "./components/Topbar";
+import MessageList from "./components/MessageList";
+import ChatInput from "./components/ChatInput";
+import { ConfirmDialog, DashboardModal, MemoryModal, Toast } from "./components/AppModals";
 
 import {
   collection,
@@ -19,6 +20,13 @@ import {
   onSnapshot,
   updateDoc,
 } from "firebase/firestore";
+
+const MODEL_OPTIONS = [
+  { value: "llama-3.3-70b-versatile", label: "Groq Llama 3.3 70B", icon: "🧠" },
+  { value: "llama-3.1-8b-instant", label: "Groq Llama 3.1 8B", icon: "⚡" },
+  { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", icon: "✨" },
+  { value: "openrouter/free", label: "OpenRouter Auto Free", icon: "🌐" },
+];
 
 const dedupeChats = (items = []) => {
   const seen = new Set();
@@ -88,12 +96,7 @@ function App() {
 
   const [selectedModel, setSelectedModel] = useState("llama-3.3-70b-versatile");
   const [modelOpen, setModelOpen] = useState(false);
-  const modelOptions = [
-    { value: "llama-3.3-70b-versatile", label: "Groq Llama 3.3 70B", icon: "🧠" },
-    { value: "llama-3.1-8b-instant", label: "Groq Llama 3.1 8B", icon: "⚡" },
-    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", icon: "✨" },
-    { value: "openrouter/free", label: "OpenRouter Auto Free", icon: "🌐" },
-  ];
+  const modelOptions = MODEL_OPTIONS;
   const currentModel = modelOptions.find((m) => m.value === selectedModel) || modelOptions[0];
 
   const getProviderName = (modelValue = selectedModel) => {
@@ -388,15 +391,18 @@ What would you like to build today?`,
   const recognitionRef = useRef(null);
   const lastOrchestratedRouteRef = useRef({ prompt: "", route: "chat", meta: null });
 
-  const filteredChats = chatHistory
-    .filter((chat) => !pinnedChats.some((p) => p.id === chat.id))
-    .filter((chat) =>
-      chat.title.toLowerCase().includes(searchQuery.toLowerCase())
+  const filteredChats = useMemo(() => {
+    const query = searchQuery.toLowerCase();
+    const pinnedIds = new Set(pinnedChats.map((chat) => chat.id));
+    return chatHistory.filter(
+      (chat) => !pinnedIds.has(chat.id) && chat.title.toLowerCase().includes(query)
     );
+  }, [chatHistory, pinnedChats, searchQuery]);
 
-  const filteredPinnedChats = pinnedChats.filter((chat) =>
-    chat.title.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredPinnedChats = useMemo(() => {
+    const query = searchQuery.toLowerCase();
+    return pinnedChats.filter((chat) => chat.title.toLowerCase().includes(query));
+  }, [pinnedChats, searchQuery]);
 
   useEffect(() => {
     setPreviewDependencyReport(analyzeProjectDependencies(projectFiles));
@@ -4005,56 +4011,6 @@ window.addEventListener("unhandledrejection", function(event) {
     }
   };
 
-  const renderMarkdown = (content) => (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        code({ inline, className, children, ...props }) {
-          const match = /language-(\w+)/.exec(className || "");
-          const language = match ? match[1] : "text";
-          const codeText = String(children).replace(/\n$/, "");
-
-          if (inline) {
-            return (
-              <code className="inline-code" {...props}>
-                {children}
-              </code>
-            );
-          }
-
-          return (
-            <div className="chat-code-block">
-              <div className="chat-code-header">
-                <span>{language.toUpperCase()}</span>
-                <button
-                  className="code-copy-btn"
-                  type="button"
-                  onClick={() => {
-                    navigator.clipboard.writeText(codeText);
-                    showToast("Code copied");
-                  }}
-                >
-                  Copy
-                </button>
-              </div>
-
-              <SyntaxHighlighter
-                language={language}
-                style={oneDark}
-                showLineNumbers
-                wrapLongLines
-                PreTag="div"
-              >
-                {codeText}
-              </SyntaxHighlighter>
-            </div>
-          );
-        },
-      }}
-    >
-      {content}
-    </ReactMarkdown>
-  );
   const isTimeDateQuestion = (text = "") => {
     const t = text.toLowerCase().trim();
 
@@ -4085,36 +4041,23 @@ window.addEventListener("unhandledrejection", function(event) {
   };
 
   const isImageGenerateQuestion = (text = "") => {
-    const t = text.toLowerCase().trim();
+    const t = String(text || "").toLowerCase().trim();
+    const imageWords = /\b(image|photo|picture|pic|artwork|illustration|poster|wallpaper|logo)\b/i;
+    const creationWords = /\b(generate|create|make|draw|design|render|banao|bnao|bana do|bnado)\b/i;
 
     return (
-      t.startsWith("generate image") ||
-      t.startsWith("generate an image") ||
-      t.startsWith("create image") ||
-      t.startsWith("create an image") ||
-      t.startsWith("make image") ||
-      t.startsWith("make an image") ||
-      t.startsWith("draw image") ||
-      t.startsWith("draw an image") ||
-      t.startsWith("image banao") ||
-      t.startsWith("photo banao") ||
-      t.startsWith("pic banao")
+      (imageWords.test(t) && creationWords.test(t)) ||
+      /\b(text[- ]to[- ]image|ai image|image generation)\b/i.test(t)
     );
   };
 
   const cleanImagePrompt = (text = "") => {
     const prompt = text
-      .replace(/^generate an image/i, "")
-      .replace(/^generate image/i, "")
-      .replace(/^create an image/i, "")
-      .replace(/^create image/i, "")
-      .replace(/^make an image/i, "")
-      .replace(/^make image/i, "")
-      .replace(/^draw an image/i, "")
-      .replace(/^draw image/i, "")
-      .replace(/^image banao/i, "")
-      .replace(/^photo banao/i, "")
-      .replace(/^pic banao/i, "")
+      .replace(/\b(please|can you|could you|mujhe|mere liye)\b/gi, "")
+      .replace(/\b(generate|create|make|draw|design|render|banao|bnao|bana do|bnado)\b/gi, "")
+      .replace(/\b(an?|the)\s+(image|photo|picture|pic|artwork|illustration)\s+(of|for)\b/gi, "")
+      .replace(/\b(image|photo|picture|pic)\b/gi, "")
+      .replace(/\s+/g, " ")
       .trim();
 
     return prompt || "beautiful futuristic artwork";
@@ -4541,6 +4484,11 @@ Today is **${date}**.`;
 
     if (/(netflix|spotify|youtube|instagram|whatsapp|uber|zomato|amazon|flipkart|twitter|facebook|discord|telegram|notion|trello|slack).*clone/i.test(t)) return true;
     if (/(clone).*(netflix|spotify|youtube|instagram|whatsapp|uber|zomato|amazon|flipkart|twitter|facebook|discord|telegram|notion|trello|slack)/i.test(t)) return true;
+    if (
+      /\b(react|vite)\b/i.test(t) &&
+      /\b(app|application|project|website|dashboard|code|components?)\b/i.test(t) &&
+      /\b(build|create|make|generate|develop|code|want|need|give|show|banao|bnao|bnado)\b/i.test(t)
+    ) return true;
 
     const buildIntent = /(build|create|make|generate|develop|code|banao|bnao|bnado)/i.test(t);
     const projectWords = /(clone|app|application|platform|system|dashboard|portal|full project|complete project|multi[-\s]?file|react project|vite project|node project|full stack|frontend project|backend project|spotify|netflix|youtube|instagram|whatsapp|todo app|chat app|ecommerce app|crm|lms)/i.test(t);
@@ -4551,6 +4499,11 @@ Today is **${date}**.`;
 
     return buildIntent && projectWords && !pureWebsiteOnly;
   };
+
+  const isGenerateProjectFollowup = (text = "") =>
+    /^(generate|generate files|generate project|create files|start generation|build files|generate code)$/i.test(
+      String(text || "").trim()
+    );
 
   const isProjectMemoryPrompt = (text = "") => {
     const t = String(text || "").toLowerCase().trim();
@@ -4582,6 +4535,7 @@ Today is **${date}**.`;
     // prompts often contain words such as "project", "analyze" and "build".
     if (isRuntimeSelfHealPrompt(text)) return "runtime-self-heal";
     if (isProjectMemoryPrompt(text)) return "project-memory";
+    if (isGenerateProjectFollowup(text)) return "project";
     if (isCodingAgentPrompt(text)) return "coding-agent";
     if (isProjectBuildPrompt(text)) return "project";
     if (isWebsiteBuildPrompt(text)) return "website";
@@ -5207,7 +5161,7 @@ Your image background has been removed successfully.`,
           }),
         });
 
-        const imageData = await imageRes.json();
+        const imageData = await readJsonResponse(imageRes, "Image generation backend");
 
         if (!imageRes.ok) {
           throw new Error(imageData.error || "Image generation failed");
@@ -5215,12 +5169,11 @@ Your image background has been removed successfully.`,
 
         const aiMsg = {
           role: "assistant",
-          content: `### 🖼 Generated Image
-
-Prompt: **${prompt}**`,
+          content: `Here is the image I generated for **${prompt}**.`,
 
           imageDataUrl: imageData.imageDataUrl,
           imageUrl: imageData.imageUrl,
+          imagePrompt: prompt,
 
           provider: imageData.provider || "Hugging Face",
           model: imageData.model || "Stable Diffusion",
@@ -5251,8 +5204,7 @@ Prompt: **${prompt}**`,
           ...newMessages,
           {
             role: "assistant",
-            content:
-              "❌ Image generation failed. Backend check karo: HF_API_KEY .env me hai ya nahi, aur server restart hua ya nahi.",
+            content: `I couldn't generate that image: ${error.message}\n\nCheck the Hugging Face token/model settings, then try again.`,
             provider: "Error",
             model: "Image Generation",
           },
@@ -6418,6 +6370,7 @@ What would you like to build today?`,
   };
 
   const downloadCode = async () => {
+    const { default: JSZip } = await import("jszip");
     const zip = new JSZip();
 
     zip.file("index.html", files.html || "<!-- HTML code empty -->");
@@ -6439,7 +6392,8 @@ What would you like to build today?`,
     showToast("ZIP downloaded");
   };
 
-  const exportChatPDF = () => {
+  const exportChatPDF = async () => {
+    const { default: jsPDF } = await import("jspdf");
     const docPdf = new jsPDF();
 
     let y = 20;
@@ -6536,63 +6490,6 @@ What would you like to build today?`,
     window.location.href = "/login";
   };
 
-  const renderChatRow = (chat) => (
-    <div key={chat.id} className="history-row-wrapper">
-      <div className="history-row">
-        <button className="history-item" onClick={() => loadChat(chat)}>
-          {chat.title}
-        </button>
-
-        <button
-          className="chat-menu-btn"
-          onClick={(e) => {
-            e.stopPropagation();
-            setOpenMenuId(openMenuId === chat.id ? null : chat.id);
-          }}
-        >
-          <span className="dot"></span>
-          <span className="dot"></span>
-          <span className="dot"></span>
-        </button>
-      </div>
-
-      {openMenuId === chat.id && (
-        <div className="chat-menu">
-          <button
-            onClick={() => {
-              setRenameChatId(chat.id);
-              setRenameText(chat.title);
-            }}
-          >
-            ✏️ Rename
-          </button>
-
-          <button onClick={() => pinChat(chat)}>
-            {isPinned(chat.id) ? "📌 Unpin Chat" : "📌 Pin Chat"}
-          </button>
-
-          <button className="danger-menu" onClick={() => deleteChat(chat.id)}>
-            🗑 Delete
-          </button>
-        </div>
-      )}
-
-      {renameChatId === chat.id && (
-        <div className="rename-box">
-          <input
-            value={renameText}
-            onChange={(e) => setRenameText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") renameChat(chat.id);
-            }}
-          />
-
-          <button onClick={() => renameChat(chat.id)}>Save</button>
-        </div>
-      )}
-    </div>
-  );
-
   return (
     <div
       className={`app ${theme} ${!desktopSidebarOpen ? "sidebar-collapsed" : ""} ${showSidebar ? "mobile-sidebar-open" : ""} ${showWorkPanel ? "panel-open" : ""}`}
@@ -6607,470 +6504,116 @@ What would you like to build today?`,
           </div>
         </div>
       )}
-      <aside className={`sidebar ${showSidebar ? "show-sidebar" : ""}`}>
-        <button className="close-sidebar" onClick={() => setShowSidebar(false)}>
-          ✕
-        </button>
-
-        <h2>SYNEZ AI</h2>
-
-        <button
-          className="side-btn"
-          onClick={async () => {
-            await saveCurrentChat();
-            newChat();
-            setShowSidebar(false);
-          }}
-        >
-          + New Chat
-        </button>
-
-        <button className="side-btn" onClick={toggleTheme}>
-          {theme === "dark" ? "☀ Light Mode" : "🌙 Dark Mode"}
-        </button>
-
-        <input
-          className="chat-search"
-          placeholder="Search chats..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-        />
-        <button className="side-btn memory-side-btn" onClick={fetchMemory}>
-          🧠 Saved Memory
-        </button>
-
-        <button className="side-btn delete-all-btn" onClick={deleteAllChats}>
-          Delete All Chats
-        </button>
-
-
-
-        <div className="history-list">
-          {filteredPinnedChats.length > 0 && (
-            <p className="history-label">Pinned</p>
-          )}
-
-          {filteredPinnedChats.map(renderChatRow)}
-
-          {filteredChats.length > 0 && (
-            <p className="history-label">Recent</p>
-          )}
-
-          {filteredChats.map(renderChatRow)}
-        </div>
-
-        <div className="sidebar-info">
-          <p>{auth.currentUser?.email || "Logged in"}</p>
-          <p>Multi AI Connected</p>
-          <p>{currentModel.label}</p>
-        </div>
-      </aside>
+      <Sidebar
+        isOpen={showSidebar}
+        theme={theme}
+        searchQuery={searchQuery}
+        pinnedChats={filteredPinnedChats}
+        chats={filteredChats}
+        openMenuId={openMenuId}
+        renameChatId={renameChatId}
+        renameText={renameText}
+        userEmail={auth.currentUser?.email}
+        currentModelLabel={currentModel.label}
+        isPinned={isPinned}
+        onClose={() => setShowSidebar(false)}
+        onNewChat={async () => {
+          await saveCurrentChat();
+          newChat();
+          setShowSidebar(false);
+        }}
+        onToggleTheme={toggleTheme}
+        onSearchChange={setSearchQuery}
+        onOpenMemory={fetchMemory}
+        onDeleteAll={deleteAllChats}
+        onLoadChat={loadChat}
+        onToggleMenu={(chatId) => setOpenMenuId(openMenuId === chatId ? null : chatId)}
+        onStartRename={(chat) => {
+          setRenameChatId(chat.id);
+          setRenameText(chat.title);
+        }}
+        onRenameTextChange={setRenameText}
+        onRename={renameChat}
+        onPin={pinChat}
+        onDelete={deleteChat}
+      />
 
       <main className={`chat-area ${showWorkPanel ? "with-work-panel" : ""}`}>
-        <header className="topbar">
-          <div>
-
-            <h1>SYNEZ AI</h1>
-            <p>Synergized Neural Intelligence</p>
-          </div>
-
-          <div className="top-actions">
-            <button
-              className="hamburger-btn"
-              aria-label="Toggle sidebar"
-              onClick={() => {
-                if (window.innerWidth <= 900) {
-                  setShowSidebar((prev) => !prev);
-                } else {
-                  setDesktopSidebarOpen((prev) => !prev);
-                }
-              }}
-            >
-              ☰
-            </button>
-            <button className="dashboard-top-btn" onClick={openDashboard}>
-              📊 Usage Dashboard
-            </button>
-
-            <button className="mobile-theme-btn" onClick={toggleTheme}>
-              {theme === "dark" ? "☀️" : "🌙"}
-            </button>
-
-            
-            <div className="model-dropdown">
-              <button type="button" className="model-trigger" onClick={() => setModelOpen((p) => !p)}>
-                <span>{currentModel.icon}</span>
-                <span className="model-trigger-text">{currentModel.label}</span>
-                <span className={modelOpen ? "model-trigger-arrow open" : "model-trigger-arrow"}>▾</span>
-              </button>
-              {modelOpen && (
-                <div className="model-menu">
-                  {modelOptions.map((model) => (
-                    <button
-                      type="button"
-                      key={model.value}
-                      className={selectedModel === model.value ? "model-option active" : "model-option"}
-                      onClick={() => {
-                        setSelectedModel(model.value);
-                        setModelOpen(false);
-                      }}
-                    >
-                      <span>{model.icon}</span><span>{model.label}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <button
-              type="button"
-              className="panel-toggle-btn"
-              onClick={() => setShowWorkPanel((prev) => !prev)}
-              title="Code Preview"
-            >
-              {showWorkPanel ? "Hide Panel" : "Code / Preview"}
-            </button>
-
-            <div className="profile-wrapper">
-              <button
-                className="profile-btn"
-                aria-label="Profile menu"
-                onClick={() => setShowProfileMenu(!showProfileMenu)}
-              >
-                {userInitial}
-              </button>
-
-              {showProfileMenu && (
-                <div className="profile-menu">
-                  <strong>{auth.currentUser?.displayName || userName}</strong>
-                  <p>{auth.currentUser?.email}</p>
-
-
-
-                  <button onClick={exportChatPDF}>
-                    📄 Export PDF
-                  </button>
-
-                  <button onClick={exportTXT}>
-                    📝 Export TXT
-                  </button>
-
-                  <button onClick={exportJSON}>
-                    📦 Export JSON
-                  </button>
-
-                  <button onClick={toggleTheme}>🎨 Toggle Theme</button>
-
-                  <button className="danger-menu" onClick={logout}>
-                    🚪 Logout
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        </header>
-
-        <section className={`messages ${messages.length <= 1 && !loading ? "welcome-mode" : "chat-mode"}`}> 
-          {messages.map((msg, index) => {
-            if (msg.role === "assistant" && !msg.content?.trim()) {
-              return null;
+        <Topbar
+          theme={theme}
+          modelOpen={modelOpen}
+          modelOptions={modelOptions}
+          selectedModel={selectedModel}
+          currentModel={currentModel}
+          showWorkPanel={showWorkPanel}
+          showProfileMenu={showProfileMenu}
+          userInitial={userInitial}
+          displayName={auth.currentUser?.displayName || userName}
+          userEmail={auth.currentUser?.email}
+          interactionVersion={`${messages.length}:${messages.at(-1)?.id || ""}:${chatHistory.length}:${previewVersion}:${Object.keys(projectFiles).length}:${loading}`}
+          onToggleSidebar={() => {
+            if (window.innerWidth <= 900) {
+              setShowSidebar((previous) => !previous);
+            } else {
+              setDesktopSidebarOpen((previous) => !previous);
             }
+          }}
+          onOpenDashboard={openDashboard}
+          onToggleTheme={toggleTheme}
+          onToggleModelMenu={() => setModelOpen((previous) => !previous)}
+          onSelectModel={(model) => {
+            setSelectedModel(model);
+            setModelOpen(false);
+          }}
+          onToggleWorkPanel={() => setShowWorkPanel((previous) => !previous)}
+          onToggleProfileMenu={() => setShowProfileMenu((previous) => !previous)}
+          onExportPdf={exportChatPDF}
+          onExportTxt={exportTXT}
+          onExportJson={exportJSON}
+          onLogout={logout}
+        />
 
-            return (
-              <div key={index} className={`message ${msg.role}`}>
-                <div className="avatar">
-                  {msg.role === "user" ? userInitial : "SY"}
-                </div>
+        <MessageList
+          messages={messages}
+          loading={loading}
+          isSpeaking={isSpeaking}
+          userInitial={userInitial}
+          messagesEndRef={messagesEndRef}
+          interactionVersion={`${messages.length}:${selectedModel}:${previewVersion}:${Object.keys(projectFiles).length}`}
+          actions={{
+            onToast: showToast,
+            onEngineeringDecision: handleEngineeringDecision,
+            onCopy: copyMessage,
+            onLike: likeMessage,
+            onDislike: dislikeMessage,
+            onShare: shareMessage,
+            onRegenerate: regenerateResponse,
+            onMore: showMoreActions,
+            onSpeak: speakText,
+            onStopSpeaking: stopSpeaking,
+            onShowSources: setActiveSources,
+          }}
+        />
 
-                <div className="bubble">
-                  <div className="markdown-body">
-                    {renderMarkdown(msg.content)}
-
-                    {(msg.imageDataUrl || msg.imageUrl) && (
-                      <div className="generated-image-wrap">
-                        <img
-                          src={msg.imageDataUrl || msg.imageUrl}
-                          alt="Generated"
-                          className="generated-image"
-                          loading="lazy"
-                          referrerPolicy="no-referrer"
-                          onError={(e) => {
-                            e.currentTarget.style.display = "none";
-                            const fallback = e.currentTarget.nextElementSibling;
-                            if (fallback) fallback.style.display = "block";
-                          }}
-                        />
-
-                        <a
-                          className="generated-image-fallback"
-                          href={msg.imageDataUrl || msg.imageUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{ display: "none" }}
-                        >
-                          Image preview failed. Open generated image ↗
-                        </a>
-                      </div>
-                    )}
-                  </div>
-
-                  {msg.role === "assistant" && (
-                    <>
-                      {msg.engineeringPlan?.status === "awaiting_approval" && msg.engineeringPlan?.id && (
-                        <div className="engineering-plan-actions">
-                          <button
-                            className="engineering-apply-btn"
-                            onClick={() => handleEngineeringDecision(index, msg.engineeringPlan.id, "apply")}
-                            disabled={loading}
-                          >
-                            Apply Plan
-                          </button>
-                          <button
-                            className="engineering-modify-btn"
-                            onClick={() => handleEngineeringDecision(index, msg.engineeringPlan.id, "modify")}
-                            disabled={loading}
-                          >
-                            Modify Plan
-                          </button>
-                          <button
-                            className="engineering-reject-btn"
-                            onClick={() => handleEngineeringDecision(index, msg.engineeringPlan.id, "reject")}
-                            disabled={loading}
-                          >
-                            Reject
-                          </button>
-                        </div>
-                      )}
-                      <div className="message-actions">
-                        <button
-                          className="action-icon-btn"
-                          title="Copy"
-                          onClick={() => copyMessage(msg.content)}
-                        >
-                          ⧉
-                        </button>
-
-                        <button
-                          className="action-icon-btn"
-                          title="Like"
-                          onClick={likeMessage}
-                        >
-                          ♡
-                        </button>
-
-                        <button
-                          className="action-icon-btn"
-                          title="Dislike"
-                          onClick={dislikeMessage}
-                        >
-                          ♧
-                        </button>
-
-                        <button
-                          className="action-icon-btn"
-                          title="Share"
-                          onClick={() => shareMessage(msg.content)}
-                        >
-                          ⇧
-                        </button>
-
-                        <button
-                          className="action-icon-btn"
-                          title="Regenerate"
-                          onClick={regenerateResponse}
-                        >
-                          ↻
-                        </button>
-
-                        <button
-                          className="action-icon-btn"
-                          title="More"
-                          onClick={showMoreActions}
-                        >
-                          ⋯
-                        </button>
-                        <button
-                          className="action-icon-btn"
-                          title={isSpeaking ? "Stop Voice" : "Read Aloud"}
-                          onClick={() => (isSpeaking ? stopSpeaking() : speakText(msg.content))}
-                        >
-                          {isSpeaking ? "⏹" : "🔊"}
-                        </button>
-
-                        <button
-                          className="sources-btn"
-                          title="Sources"
-                          onClick={() => setActiveSources(msg.sources || [])}
-                        >
-                          ◧ Sources
-                        </button>
-                      </div>
-
-                      {msg.provider && (
-                        <div className="model-badge">
-                          🤖 {msg.provider} • {msg.model}
-                        </div>
-                      )}
-
-                      {msg.sources && msg.sources.length > 0 && (
-                        <div className="source-cards-v2">
-                          {msg.sources.slice(0, 6).map((source, sourceIndex) => (
-                            <a
-                              key={sourceIndex}
-                              href={source.link}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="source-card-v2"
-                            >
-                              <div className="source-domain">
-                                🌐 {source.displayLink || "Source"}
-                              </div>
-
-                              <strong>{source.title || "Untitled Source"}</strong>
-
-                              {source.snippet && (
-                                <p>{source.snippet}</p>
-                              )}
-
-                              <span>Open Source ↗</span>
-                            </a>
-                          ))}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-
-          {loading && messages[messages.length - 1]?.role !== "assistant" && (
-            <div className="message assistant">
-              <div className="avatar">SY</div>
-
-              <div className="bubble thinking-bubble">
-                <span className="thinking-text">
-                  SYNEZ AI is thinking
-                </span>
-
-                <div className="thinking-dots">
-                  <span></span>
-                  <span></span>
-                  <span></span>
-                </div>
-              </div>
-            </div>
-          )}
-
-          <div ref={messagesEndRef}></div>
-        </section>
-
-        <div className="input-area">
-          <div className={`chat-input-box ${selectedFiles.length || selectedImages.length ? "has-upload" : ""}`}>
-              {(selectedFiles.length > 0 || selectedImages.length > 0) && (
-                <div className="composer-attachments-list">
-                  {selectedFiles.map((file, index) => (
-                    <div className="composer-attachment-card" key={`${file.name}-${file.size}-${index}`}>
-                      <span className="composer-attachment-icon">📄</span>
-                      <span className="composer-attachment-name">{file.name}</span>
-                      <button
-                        type="button"
-                        className="composer-attachment-remove"
-                        onClick={() => removeSelectedFile(index)}
-                        aria-label="Remove attachment"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-
-                  {selectedImages.map((file, index) => {
-                    const preview = imagePreviews[index]?.url;
-                    return (
-                      <div className="composer-attachment-card image-attachment-card" key={`${file.name}-${file.size}-${index}`}>
-                        {preview ? (
-                          <img src={preview} alt={file.name} className="composer-attachment-thumb" />
-                        ) : (
-                          <span className="composer-attachment-icon">🖼️</span>
-                        )}
-                        <span className="composer-attachment-name">{file.name}</span>
-                        <button
-                          type="button"
-                          className="composer-attachment-remove"
-                          onClick={() => removeSelectedImage(index)}
-                          aria-label="Remove attachment"
-                        >
-                          ×
-                        </button>
-                      </div>
-                    );
-                  })}
-
-                  {(selectedFiles.length + selectedImages.length) > 1 && (
-                    <button
-                      type="button"
-                      className="composer-clear-all"
-                      onClick={clearUpload}
-                    >
-                      Clear all · {selectedFiles.length + selectedImages.length}
-                    </button>
-                  )}
-                </div>
-              )}
-            <label className="upload-btn" title="Add files">
-              +
-           <input
-                type="file"
-                hidden
-                multiple
-                accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.js,.jsx,.ts,.tsx,.html,.css,.py,.java,.cpp,.c,.xml,.yml,.yaml,image/*"
-                onChange={(e) => {
-                  handleFileSelect(e.target.files);
-                  e.target.value = "";
-                }}
-              />
-            </label>
-
-            <textarea
-              ref={inputRef}
-              rows={1}
-              placeholder="Message SYNEZ AI..."
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleEnter}
-            />
-            {isSpeaking && (
-              <button
-                className="stop-speech-btn"
-                onClick={stopSpeaking}
-              >
-                ⏹ Stop Voice
-              </button>
-            )}
-            <button className="voice-btn" onClick={toggleVoiceInput} type="button">
-              🎙
-            </button>
-
-            <button
-              onClick={loading ? stopGenerating : sendMessage}
-              className={`send-circle-btn ${loading ? "stop-btn" : ""}`}
-            >
-              {loading ? (
-                "■"
-              ) : (
-                <svg viewBox="0 0 24 24" fill="none">
-                  <path
-                    d="M12 19V5M12 5L6 11M12 5L18 11"
-                    stroke="currentColor"
-                    strokeWidth="3"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              )}
-            </button>
-          </div>
-        </div>
+        <ChatInput
+          inputRef={inputRef}
+          value={input}
+          loading={loading}
+          isSpeaking={isSpeaking}
+          selectedFiles={selectedFiles}
+          selectedImages={selectedImages}
+          imagePreviews={imagePreviews}
+          onChange={setInput}
+          onKeyDown={handleEnter}
+          onFileSelect={handleFileSelect}
+          onRemoveFile={removeSelectedFile}
+          onRemoveImage={removeSelectedImage}
+          onClearUploads={clearUpload}
+          onStopSpeaking={stopSpeaking}
+          onToggleVoice={toggleVoiceInput}
+          onSubmit={sendMessage}
+          onStopGenerating={stopGenerating}
+        />
       </main>
 
       {showWorkPanel && (
@@ -7597,151 +7140,37 @@ What would you like to build today?`,
 
 
       {showMemoryPanel && (
-        <div className="memory-overlay">
-          <div className="memory-modal">
-            <div className="memory-header">
-              <div>
-                <h3>🧠 Saved Memory</h3>
-                <p>Memory is saved separately for the logged-in account.</p>
-              </div>
-
-              <button
-                className="memory-close-btn"
-                onClick={() => setShowMemoryPanel(false)}
-              >
-                ✕
-              </button>
-            </div>
-
-            {memoryLoading ? (
-              <div className="memory-empty">Loading memory...</div>
-            ) : Object.keys(savedMemory).length === 0 ? (
-              <div className="memory-empty">
-                No saved memory yet.
-                <br />
-                Try: <strong>remember project is SYNEZ AI</strong>
-              </div>
-            ) : (
-              <div className="memory-list">
-                {Object.entries(savedMemory).map(([key, value]) => (
-                  <div className="memory-item" key={key}>
-                    <div>
-                      <span>{key}</span>
-                      <strong>{String(value)}</strong>
-                    </div>
-
-                    <button onClick={() => forgetMemoryKey(key)}>
-                      Forget
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <div className="memory-actions">
-              <button onClick={fetchMemory}>Refresh</button>
-              <button className="memory-danger-btn" onClick={clearAllMemory}>
-                Clear All
-              </button>
-            </div>
-          </div>
-        </div>
+        <MemoryModal
+          isLoading={memoryLoading}
+          memory={savedMemory}
+          onClose={() => setShowMemoryPanel(false)}
+          onRefresh={fetchMemory}
+          onForget={forgetMemoryKey}
+          onClear={clearAllMemory}
+        />
       )}
 
       {showDashboard && (
-        <div className="dashboard-overlay">
-          <div className="dashboard-modal">
-            <div className="dashboard-header">
-              <div>
-                <h3>📊 Usage Dashboard</h3>
-                <p>SYNEZ AI activity overview</p>
-              </div>
-
-              <button
-                className="dashboard-close-btn"
-                onClick={() => setShowDashboard(false)}
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="dashboard-grid">
-              <div className="dashboard-card">
-                <span>Total Chats</span>
-                <strong>{chatHistory.length}</strong>
-              </div>
-
-              <div className="dashboard-card">
-                <span>Total Messages</span>
-                <strong>{getTotalMessages()}</strong>
-              </div>
-
-              <div className="dashboard-card">
-                <span>Saved Memories</span>
-                <strong>{getMemoryCount()}</strong>
-              </div>
-
-              <div className="dashboard-card">
-                <span>Current Model</span>
-                <strong>{selectedModel}</strong>
-              </div>
-
-              <div className="dashboard-card">
-                <span>User</span>
-                <strong>{auth.currentUser?.email || userName}</strong>
-              </div>
-
-              <div className="dashboard-card">
-                <span>Theme</span>
-                <strong>{theme}</strong>
-              </div>
-            </div>
-
-            <div className="dashboard-status">
-              <div>✅ Web Search Ready</div>
-              <div>✅ Agent Mode Pro+ Ready</div>
-              <div>✅ Voice Ready</div>
-              <div>✅ Drag & Drop Ready</div>
-              <div>✅ Memory Ready</div>
-            </div>
-          </div>
-        </div>
+        <DashboardModal
+          totalChats={chatHistory.length}
+          totalMessages={getTotalMessages()}
+          memoryCount={getMemoryCount()}
+          selectedModel={selectedModel}
+          user={auth.currentUser?.email || userName}
+          theme={theme}
+          onClose={() => setShowDashboard(false)}
+        />
       )}
 
       {confirmBox.show && (
-        <div className="confirm-overlay">
-          <div className="confirm-modal">
-            <h3>Delete Chat?</h3>
-
-            <p>
-              {confirmBox.type === "all"
-                ? "Are you sure you want to delete all chats?"
-                : "Are you sure you want to delete this chat?"}
-            </p>
-
-            <div className="confirm-actions">
-              <button
-                className="cancel-btn"
-                onClick={() =>
-                  setConfirmBox({
-                    show: false,
-                    type: "",
-                    id: null,
-                  })
-                }
-              >
-                Cancel
-              </button>
-
-              <button className="confirm-delete-btn" onClick={confirmDelete}>
-                Delete
-              </button>
-            </div>
-          </div>
-        </div>
+        <ConfirmDialog
+          type={confirmBox.type}
+          onCancel={() => setConfirmBox({ show: false, type: "", id: null })}
+          onConfirm={confirmDelete}
+        />
       )}
 
-      {toast && <div className="toast">✅ {toast}</div>}
+      {toast && <Toast message={toast} />}
     </div>
   );
 
