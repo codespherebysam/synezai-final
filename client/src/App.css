@@ -8584,3 +8584,50 @@ html:has(.project-preview-modal) {
     width: 100%;
   }
 }
+
+/* Performance guardrails */
+.app {
+  animation: none;
+  background-size: auto;
+}
+
+.app::before,
+.app::after {
+  animation: none;
+}
+
+.message {
+  content-visibility: auto;
+  contain: layout paint style;
+  contain-intrinsic-size: auto 180px;
+}
+
+.generated-image {
+  height: auto;
+  aspect-ratio: auto;
+}
+
+@media (max-width: 900px) {
+  .app::before,
+  .app::after {
+    display: none;
+  }
+
+  .sidebar,
+  .topbar,
+  .chat-input-box,
+  .bubble {
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
