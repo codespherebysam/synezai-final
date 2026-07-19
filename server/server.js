@@ -7,8 +7,52 @@ const pdfParse = require("pdf-parse");
 const mammoth = require("mammoth");
 require("dotenv").config();
 
+const { normalizeImageDataList, hasImagePayload } = require("./lib/imageUtils");
+const {
+  SERPER_KEYS,
+  getSerperKey,
+  cleanSnippet,
+  shouldUseWikipedia,
+  searchWikipedia,
+  searchSerper,
+  mergeUniqueResults,
+} = require("./lib/search");
+const {
+  isTimeDateWeatherNewsRequest,
+  extractLikelyLocation,
+  getIndiaDateTimeParts,
+  getWeatherSummary,
+  isLowQualitySource,
+  getNewsResults,
+  getLocalNewsResults,
+  buildQuickInfoResponse,
+} = require("./lib/liveInfo");
+const {
+  MASTER_INTENTS_V7,
+  normalizeIntentTextV7,
+  classifyMasterIntentV7,
+  detectTaskType,
+  isProjectBuildRequest,
+  isWebsiteBuildRequest,
+  isRuntimeSelfHealRequest,
+  isGenerateProjectRequest,
+} = require("./lib/intent");
+
 const app = express();
 
+/* ============================================================
+   🚀 DEPLOYMENT — CORS
+   Local dev: cors() with no options allows all origins (fine).
+   In PRODUCTION, lock this to your deployed frontend domain so
+   only your site can call this backend. Replace the line below with:
+
+     app.use(cors({
+       origin: process.env.CLIENT_ORIGIN || "https://your-frontend-domain.com",
+       methods: ["GET", "POST", "DELETE"],
+     }));
+
+   and set CLIENT_ORIGIN in the backend host's env variables.
+   ============================================================ */
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
@@ -119,6 +163,12 @@ const groqModels = [
 
 const geminiModels = ["gemini-2.5-flash"];
 
+// Vision-capable (multimodal) models used when an image is uploaded.
+const GROQ_VISION_MODELS = [
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "meta-llama/llama-4-maverick-17b-128e-instruct",
+];
+
 const createSystemPrompt = (userName = "User", userEmail = "guest") => `
 You are SYNEZ AI — Synergized Neural Intelligence at its Peak.
 
@@ -149,12 +199,21 @@ Language Rules:
 4. If user asks "Hinglish me bolo", reply in Roman Hinglish.
 5. If user asks "English me bolo", reply in English.
 
+Conversation Style:
+1. Talk like a real human friend having a natural conversation — warm, clear, and easy going. Use contractions and everyday words, not stiff robotic phrasing.
+2. Keep normal chat replies conversational and to the point. Do not over-format casual talk with heavy headings or long bullet lists.
+3. Match the user's energy and language. If they are casual, be casual; if they are formal, be formal.
+4. Show a little personality and warmth. Acknowledge how the user feels when it fits, and a light emoji is fine occasionally — never spammy.
+5. Never sound like a corporate manual. Avoid filler like "As an AI" or "I'm just a program". Just talk like a helpful friend who happens to be great at coding.
+6. Prefer short, easy sentences over long dense paragraphs. Explain things simply, like you would to a friend.
+
 General Rules:
-1. Answer directly and professionally.
+1. Answer directly and naturally.
 2. Do not repeat your identity.
 3. Do not say you cannot read uploaded PDF/DOCX if document text is present in the user message.
 4. For document comparison, compare the extracted text already present in the prompt.
-5. For website/code requests, return valid preview-ready code blocks.
+5. Only generate website/app/code when the user CLEARLY asks you to build, create, or make something. If the user merely mentions words like "website", "time", "weather" or "news" in casual conversation, just reply naturally in words — never auto-generate a website, project, or code block for them.
+6. When you are unsure whether the user wants something built, ask a short clarifying question instead of generating code.
 `;
 
 
@@ -201,67 +260,182 @@ function isImageGenerationRequest(text = "") {
   ].some((word) => t.includes(word));
 }
 
-async function callGroq(model, safeMessages, systemPrompt) {
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "system", content: systemPrompt }, ...safeMessages],
-      temperature: 0.7,
-      max_tokens: 2048,
-    }),
-  });
+/* =========================
+   MULTI-KEY API POOLS
+   One or many keys per provider so a single key hitting its rate limit never
+   blocks every user. Requests are round-robined across keys, and on a
+   rate-limit / auth error (429/401/403/402) the call auto-rotates to the next
+   key. Configure any of these in server/.env:
+     GROQ_API_KEY=key                       (single)
+     GROQ_API_KEY_1=... GROQ_API_KEY_2=...  (numbered, up to _20)
+     GROQ_API_KEYS=key1,key2,key3           (comma / space / newline separated)
+   Same pattern for GEMINI_API_KEY(S), OPENROUTER_API_KEY(S), HF_API_KEY(S).
+========================= */
 
-  const data = await response.json();
+const KEY_ENV_PREFIX = {
+  Groq: "GROQ_API_KEY",
+  Gemini: "GEMINI_API_KEY",
+  OpenRouter: "OPENROUTER_API_KEY",
+  HF: "HF_API_KEY",
+};
 
-  if (!response.ok) {
-    throw new Error(data?.error?.message || "Groq API error");
+function getKeyPool(provider) {
+  const prefix = KEY_ENV_PREFIX[provider];
+  if (!prefix) return [];
+
+  const keys = [];
+  const push = (value) => {
+    String(value || "")
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .forEach((k) => keys.push(k));
+  };
+
+  push(process.env[prefix]); // e.g. GROQ_API_KEY
+  push(process.env[`${prefix}S`]); // e.g. GROQ_API_KEYS (comma/space separated)
+  for (let i = 1; i <= 20; i++) push(process.env[`${prefix}_${i}`]); // GROQ_API_KEY_1..20
+
+  return [...new Set(keys)];
+}
+
+const keyRotation = {};
+function nextKeyIndex(provider, poolSize) {
+  if (poolSize <= 1) return 0;
+  const current = keyRotation[provider] || 0;
+  keyRotation[provider] = (current + 1) % poolSize;
+  return current;
+}
+
+// Statuses that mean "this key is exhausted/blocked" — rotate to the next key.
+const KEY_ROTATE_STATUS = new Set([429, 401, 403, 402]);
+
+// Runs makeFetch(key) against each key in the pool (starting at a rotating
+// offset) until one succeeds. Returns the first OK Response. Rotates on
+// rate-limit/auth errors; fails fast on genuine request errors.
+async function callWithKeyRotation(provider, makeFetch) {
+  const keys = getKeyPool(provider);
+  if (!keys.length) {
+    throw new Error(
+      `${provider} API key missing in server/.env. Add ${KEY_ENV_PREFIX[provider]} (or ${KEY_ENV_PREFIX[provider]}_1, ${KEY_ENV_PREFIX[provider]}_2 ...) and restart the server.`
+    );
   }
 
+  const start = nextKeyIndex(provider, keys.length);
+  let lastError = null;
+
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[(start + i) % keys.length];
+    let response;
+
+    try {
+      response = await makeFetch(key);
+    } catch (networkError) {
+      lastError = networkError;
+      continue;
+    }
+
+    if (response.ok) return response;
+
+    let message = `${provider} API error (${response.status})`;
+    try {
+      const errData = await response.clone().json();
+      message = errData?.error?.message || message;
+    } catch {
+      /* non-JSON error body */
+    }
+    lastError = new Error(message);
+
+    if (!KEY_ROTATE_STATUS.has(response.status)) throw lastError;
+
+    console.log(
+      `KEY ROTATE [${provider}]: key #${((start + i) % keys.length) + 1}/${keys.length} hit ${response.status}, trying next key`
+    );
+  }
+
+  throw new Error(
+    `All ${keys.length} ${provider} API key(s) are rate-limited or invalid right now. ${lastError?.message || ""}`.trim()
+  );
+}
+
+// Build OpenAI-compatible messages (Groq/OpenRouter). When images are present,
+// they are attached to the most recent user turn as image_url parts so
+// vision-capable models can actually see them.
+function buildOpenAiMessages(safeMessages, systemPrompt, imageData = null) {
+  const messages = [{ role: "system", content: systemPrompt }, ...safeMessages];
+  const images = normalizeImageDataList(imageData).slice(0, 5);
+  if (!images.length) return messages;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      const textContent =
+        typeof messages[i].content === "string" ? messages[i].content : "";
+      messages[i] = {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: textContent || "Describe the uploaded image(s).",
+          },
+          ...images.map((img) => ({
+            type: "image_url",
+            image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+          })),
+        ],
+      };
+      break;
+    }
+  }
+
+  return messages;
+}
+
+async function callGroq(model, safeMessages, systemPrompt, imageData = null) {
+  const messages = buildOpenAiMessages(safeMessages, systemPrompt, imageData);
+  const response = await callWithKeyRotation("Groq", (key) =>
+    fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 2048,
+      }),
+    })
+  );
+
+  const data = await response.json();
   return data?.choices?.[0]?.message?.content || "No response from Groq.";
 }
 
-async function callOpenRouter(model, safeMessages, systemPrompt) {
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      "HTTP-Referer": "http://localhost:5173",
-      "X-Title": "SYNEZ AI",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "system", content: systemPrompt }, ...safeMessages],
-      temperature: 0.7,
-      max_tokens: 2048,
-    }),
-  });
+async function callOpenRouter(model, safeMessages, systemPrompt, imageData = null) {
+  const messages = buildOpenAiMessages(safeMessages, systemPrompt, imageData);
+  const response = await callWithKeyRotation("OpenRouter", (key) =>
+    fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+        "HTTP-Referer": "http://localhost:5173",
+        "X-Title": "SYNEZ AI",
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 2048,
+      }),
+    })
+  );
 
   const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(data?.error?.message || "OpenRouter API error");
-  }
-
   return data?.choices?.[0]?.message?.content || "No response from OpenRouter.";
 }
 
-function normalizeImageDataList(imageData = null) {
-  if (Array.isArray(imageData)) {
-    return imageData.filter((item) => item?.base64 && item?.mimeType);
-  }
-
-  return imageData?.base64 && imageData?.mimeType ? [imageData] : [];
-}
-
-function hasImagePayload(imageData = null) {
-  return normalizeImageDataList(imageData).length > 0;
-}
 
 async function callGemini(model, safeMessages, systemPrompt, imageData = null) {
   const conversationText = safeMessages
@@ -290,383 +464,27 @@ ${conversationText}`,
     });
   });
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts }],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 2048,
+  const response = await callWithKeyRotation("Gemini", (key) =>
+    fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-      }),
-    }
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: {
+            temperature: 0.7,
+            maxOutputTokens: 2048,
+          },
+        }),
+      }
+    )
   );
 
   const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(data?.error?.message || "Gemini API error");
-  }
-
   return data?.candidates?.[0]?.content?.parts?.[0]?.text || "No response from Gemini.";
-}
-
-/* =========================
-   SEARCH SYSTEM
-   Serper + Wikipedia
-========================= */
-
-const SERPER_KEYS = [
-  process.env.SERPER_API_KEY,
-  process.env.SERPER_API_KEY_1,
-  process.env.SERPER_API_KEY_2,
-  process.env.SERPER_API_KEY_3,
-  process.env.SERPER_API_KEY_4,
-].filter(Boolean);
-
-let serperIndex = 0;
-
-function getSerperKey() {
-  if (!SERPER_KEYS.length) return null;
-
-  const key = SERPER_KEYS[serperIndex];
-  serperIndex = (serperIndex + 1) % SERPER_KEYS.length;
-
-  return key;
-}
-
-function cleanSnippet(text = "") {
-  return String(text)
-    .replace(/<[^>]*>/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function shouldUseWikipedia(query = "") {
-  const q = query.toLowerCase();
-
-  return (
-    q.includes("who is") ||
-    q.includes("what is") ||
-    q.includes("history") ||
-    q.includes("about") ||
-    q.includes("explain") ||
-    q.includes("meaning")
-  );
-}
-
-async function searchWikipedia(query, limit = 5) {
-  try {
-    const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
-      query
-    )}&format=json&origin=*`;
-
-    const response = await fetch(url);
-    const data = await response.json();
-
-    const results = data?.query?.search || [];
-
-    const keywords = query
-      .toLowerCase()
-      .split(" ")
-      .map((word) => word.trim())
-      .filter(Boolean)
-      .filter(
-        (word) =>
-          !["who", "is", "what", "the", "a", "an", "of", "in", "on", "for"].includes(word)
-      );
-
-    const filtered = results.filter((item) => {
-      const title = (item.title || "").toLowerCase();
-      const snippet = cleanSnippet(item.snippet || "").toLowerCase();
-
-      if (!keywords.length) return true;
-
-      return keywords.some(
-        (word) => title.includes(word) || snippet.includes(word)
-      );
-    });
-
-    return filtered.slice(0, limit).map((item) => ({
-      title: item.title || "Wikipedia Result",
-      snippet: cleanSnippet(item.snippet || ""),
-      link: `https://en.wikipedia.org/wiki/${encodeURIComponent(
-        item.title.replaceAll(" ", "_")
-      )}`,
-      displayLink: "wikipedia.org",
-      sourceType: "Wikipedia",
-    }));
-  } catch (error) {
-    console.log("WIKIPEDIA ERROR:", error.message);
-    return [];
-  }
-}
-
-async function searchSerper(query, num = 8) {
-  try {
-    const apiKey = getSerperKey();
-
-    if (!apiKey) {
-      console.log("No Serper API key found");
-      return [];
-    }
-
-    const response = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        q: query,
-        gl: "in",
-        hl: "en",
-        num,
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.log("SERPER ERROR:", data);
-      return [];
-    }
-
-    const results = [];
-
-    if (data.answerBox) {
-      results.push({
-        title: data.answerBox.title || "Answer Box",
-        snippet:
-          data.answerBox.answer ||
-          data.answerBox.snippet ||
-          data.answerBox.description ||
-          "",
-        link: data.answerBox.link || "",
-        displayLink: data.answerBox.source || "Google Answer",
-        sourceType: "Answer Box",
-      });
-    }
-
-    if (Array.isArray(data.news)) {
-      data.news.forEach((item) => {
-        results.push({
-          title: item.title || "",
-          snippet: item.snippet || item.date || "",
-          link: item.link || "",
-          displayLink: item.source || "",
-          sourceType: "News",
-        });
-      });
-    }
-
-    if (Array.isArray(data.organic)) {
-      data.organic.forEach((item) => {
-        results.push({
-          title: item.title || "",
-          snippet: item.snippet || "",
-          link: item.link || "",
-          displayLink: item.displayLink || "",
-          sourceType: "Web",
-        });
-      });
-    }
-
-    return results
-      .filter((r) => r.title || r.snippet)
-      .filter((r) => r.link)
-      .slice(0, num);
-  } catch (error) {
-    console.log("SERPER SEARCH ERROR:", error.message);
-    return [];
-  }
-}
-
-function mergeUniqueResults(results = []) {
-  const seen = new Set();
-  const unique = [];
-
-  for (const item of results) {
-    const key = item.link || item.title;
-
-    if (!key || seen.has(key)) continue;
-
-    seen.add(key);
-    unique.push(item);
-  }
-
-  return unique;
-}
-
-
-/* =========================
-   INTENT ROUTER V2 HELPERS
-   Weather / Time / Date / Local News must run before project architecture.
-========================= */
-
-function isTimeDateWeatherNewsRequest(text = "") {
-  const t = String(text || "").toLowerCase();
-
-  // Phase 6.3 guard: words such as "runtime", "estimated fix time" and
-  // "latest dependencies" inside engineering prompts are not live-info intents.
-  const codingContext = /\b(analyze|analyse|inspect|review|project health|dependency graph|runtime error|syntax error|logic error|broken import|missing import|codebase|current project|uploaded project|refactor|production readiness|estimated fix time)\b/i.test(t);
-  const buildContext = /\b(build|create|generate|develop|make)\b[\s\S]{0,80}\b(app|application|platform|workspace|website|project|dashboard|portal|clone|system)\b/i.test(t);
-  if (codingContext || buildContext) return false;
-
-  const asksDateTime = /\b(date|time|day|today|aaj|aj|samay|waqt|tarikh|tareekh)\b/i.test(t);
-  const asksWeather = /\b(weather|mausam|temperature|temp|rain|barish|humidity|wind|forecast)\b/i.test(t);
-  const asksNews = /\b(news|khabar|khabrein|samachar|latest|aaj ki news|today news|hua|kya kya hua)\b/i.test(t);
-  const hasLocalContext = /\b(dhanbad|jharkhand|india|near me|local|city)\b/i.test(t);
-
-  return asksWeather || asksNews || (asksDateTime && (hasLocalContext || asksWeather || asksNews));
-}
-
-function extractLikelyLocation(text = "") {
-  const t = String(text || "");
-  const known = ["Dhanbad", "Jharkhand", "Ranchi", "Bokaro", "Jamshedpur", "Delhi", "Mumbai", "Kolkata", "Bengaluru", "India"];
-  const found = known.find((name) => new RegExp(`\\b${name}\\b`, "i").test(t));
-  if (found === "Jharkhand") return "Dhanbad, Jharkhand";
-  if (found === "India") return "Dhanbad, Jharkhand";
-  return found || "Dhanbad, Jharkhand";
-}
-
-function getIndiaDateTimeParts() {
-  const now = new Date();
-  const formatter = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  });
-
-  const dateOnly = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  }).format(now);
-
-  const timeOnly = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  }).format(now);
-
-  const weekday = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    weekday: "long",
-  }).format(now);
-
-  return {
-    full: formatter.format(now),
-    dateOnly,
-    timeOnly,
-    weekday,
-  };
-}
-
-async function getWeatherSummary(location = "Dhanbad, Jharkhand") {
-  try {
-    const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
-    const response = await fetch(url);
-    const data = await response.json();
-    const current = data.current_condition?.[0];
-    const area = data.nearest_area?.[0];
-
-    if (!current) return null;
-
-    return {
-      location: area?.areaName?.[0]?.value || location,
-      country: area?.country?.[0]?.value || "",
-      temperature: current.temp_C,
-      feelsLike: current.FeelsLikeC,
-      condition: current.weatherDesc?.[0]?.value,
-      humidity: current.humidity,
-      wind: current.windspeedKmph,
-      source: "wttr.in",
-    };
-  } catch (error) {
-    console.log("QUICK WEATHER ERROR:", error.message);
-    return null;
-  }
-}
-
-function isLowQualitySource(item = {}) {
-  const source = `${item.displayLink || ""} ${item.link || ""}`.toLowerCase();
-  return /instagram|youtube|facebook|tiktok|shorts|pinterest|reddit/.test(source);
-}
-
-async function getLocalNewsResults(location = "Dhanbad, Jharkhand") {
-  const query = `latest ${location} news today -instagram -facebook -youtube -shorts`;
-  const results = await searchSerper(query, 10);
-  return results
-    .filter((item) => !isLowQualitySource(item))
-    .slice(0, 6);
-}
-
-async function buildQuickInfoResponse(userPrompt = "") {
-  const location = extractLikelyLocation(userPrompt);
-  const wantsNews = /\b(news|khabar|khabrein|samachar|latest|hua|kya kya hua)\b/i.test(userPrompt);
-  const wantsWeather = /\b(weather|mausam|temperature|temp|rain|barish|humidity|wind|forecast)\b/i.test(userPrompt);
-  const dateTime = getIndiaDateTimeParts();
-  const weather = wantsWeather || /dhanbad|jharkhand/i.test(userPrompt)
-    ? await getWeatherSummary(location)
-    : null;
-  const news = wantsNews ? await getLocalNewsResults(location) : [];
-
-  const lines = [];
-  lines.push(`### ${location} — Today`);
-  lines.push(`**Date:** ${dateTime.dateOnly}`);
-  lines.push(`**Day:** ${dateTime.weekday}`);
-  lines.push(`**Current Time:** ${dateTime.timeOnly} IST`);
-
-  if (weather) {
-    lines.push("");
-    lines.push("### Weather");
-    lines.push(`- **Condition:** ${weather.condition || "N/A"}`);
-    lines.push(`- **Temperature:** ${weather.temperature}°C`);
-    lines.push(`- **Feels like:** ${weather.feelsLike}°C`);
-    lines.push(`- **Humidity:** ${weather.humidity}%`);
-    lines.push(`- **Wind:** ${weather.wind} km/h`);
-  }
-
-  if (wantsNews) {
-    lines.push("");
-    lines.push("### Verified Local News");
-
-    if (news.length) {
-      news.slice(0, 5).forEach((item, index) => {
-        lines.push(`${index + 1}. **${item.title || "News update"}** — ${item.snippet || "Open the source for details."}`);
-      });
-      lines.push("");
-      lines.push("_News items are based only on retrieved web sources. SYNEZ AI did not invent any local event._");
-    } else {
-      lines.push("I could not retrieve reliable fresh local news results right now. I will not invent news. Try again later or ask for Jharkhand/India news.");
-    }
-  }
-
-  return {
-    reply: lines.join("\n"),
-    provider: wantsNews ? "SYNEZ AI Search + Weather" : "SYNEZ AI Weather/Time",
-    model: "Intent Router v2",
-    task: "quick-info",
-    sources: [
-      ...(weather ? [{ title: "Weather source", snippet: "Current weather data", displayLink: "wttr.in", link: `https://wttr.in/${encodeURIComponent(location)}` }] : []),
-      ...news,
-    ],
-  };
 }
 
 function wantsImageEdit(text = "") {
@@ -819,6 +637,192 @@ app.post("/weather", async (req, res) => {
    Hugging Face Inference API
 ========================= */
 
+// Models are tried in order. The first is overridable via HF_IMAGE_MODEL.
+// Hugging Face migrated to "Inference Providers"; the built-in `hf-inference`
+// provider no longer serves several older text-to-image models, so we keep a
+// fallback chain of models that are commonly available and try more than one
+// host endpoint for each.
+const HF_IMAGE_MODELS = [
+  process.env.HF_IMAGE_MODEL,
+  "black-forest-labs/FLUX.1-schnell",
+  "black-forest-labs/FLUX.1-dev",
+  "stabilityai/stable-diffusion-xl-base-1.0",
+  "stabilityai/stable-diffusion-2-1",
+].filter(Boolean);
+
+// For each model we try the new router first, then the legacy serverless host.
+const HF_IMAGE_HOSTS = [
+  (model) => `https://router.huggingface.co/hf-inference/models/${model}`,
+  (model) => `https://api-inference.huggingface.co/models/${model}`,
+];
+
+// HF's built-in `hf-inference` provider no longer serves text-to-image models
+// (it returns 410 "deprecated"). Image generation now goes through partner
+// "Inference Providers" via the router's OpenAI-compatible endpoint:
+//   POST https://router.huggingface.co/<provider>/v1/images/generations
+// We try several providers/models in order until one succeeds. Override the
+// order/model with HF_IMAGE_PROVIDER and HF_IMAGE_MODEL in .env.
+const HF_IMAGE_PROVIDERS = [
+  process.env.HF_IMAGE_PROVIDER && process.env.HF_IMAGE_MODEL
+    ? { provider: process.env.HF_IMAGE_PROVIDER, model: process.env.HF_IMAGE_MODEL }
+    : null,
+  // Use canonical HF model IDs; the router maps them to each provider.
+  { provider: "together", model: "black-forest-labs/FLUX.1-schnell" },
+  { provider: "fal-ai", model: "black-forest-labs/FLUX.1-schnell" },
+  { provider: "replicate", model: "black-forest-labs/FLUX.1-schnell" },
+  { provider: "nebius", model: "black-forest-labs/FLUX.1-schnell" },
+  { provider: "together", model: "stabilityai/stable-diffusion-xl-base-1.0" },
+].filter(Boolean);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Convert a remote image URL (some providers return a URL instead of base64)
+// into a data URL so the client can render it inline.
+async function imageUrlToDataUrl(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to download generated image (${response.status})`);
+  const contentType = response.headers.get("content-type") || "image/png";
+  const arrayBuffer = await response.arrayBuffer();
+  const mimeType = contentType.split(";")[0] || "image/png";
+  return {
+    imageDataUrl: `data:${mimeType};base64,${Buffer.from(arrayBuffer).toString("base64")}`,
+    mimeType,
+  };
+}
+
+// Text-to-image through an HF Inference Provider (OpenAI-compatible endpoint).
+async function requestHfProviderImage(provider, model, prompt, apiKey) {
+  const response = await fetch(
+    `https://router.huggingface.co/${provider}/v1/images/generations`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey || process.env.HF_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        prompt,
+        response_format: "b64_json",
+        n: 1,
+      }),
+    }
+  );
+
+  if (response.ok) {
+    const data = await response.json().catch(() => null);
+    const item = Array.isArray(data?.data) ? data.data[0] : null;
+    const b64 = item?.b64_json || data?.b64_json;
+
+    if (b64) {
+      return {
+        ok: true,
+        imageDataUrl: `data:image/png;base64,${b64}`,
+        mimeType: "image/png",
+      };
+    }
+
+    const remoteUrl = item?.url || data?.url;
+    if (remoteUrl) {
+      try {
+        const downloaded = await imageUrlToDataUrl(remoteUrl);
+        return { ok: true, ...downloaded };
+      } catch (error) {
+        return { ok: false, status: 502, error: error.message };
+      }
+    }
+
+    return { ok: false, status: 502, error: "Provider returned no image data." };
+  }
+
+  const errorText = await response.text().catch(() => "");
+  return {
+    ok: false,
+    status: response.status,
+    retryable: response.status === 503,
+    error: describeHfFailure(response.status, errorText),
+  };
+}
+
+// Turn a raw HF failure into a short, human-readable hint.
+function describeHfFailure(status, body) {
+  const raw = (body || "").slice(0, 300);
+  if (status === 401)
+    return "Invalid HF_API_KEY (401). Generate a new token at https://huggingface.co/settings/tokens";
+  if (status === 403)
+    return "HF token lacks permission (403). Create a token with the 'Make calls to Inference Providers' scope, or the model is gated — accept its license on its HF model page.";
+  if (status === 404)
+    return "Model not served on this provider (404). Set HF_IMAGE_MODEL in .env to a model you can access.";
+  if (status === 410)
+    return "This model is deprecated on this provider (410).";
+  if (status === 429)
+    return "Rate limit / free quota exceeded (429). Wait a bit or upgrade your HF plan.";
+  if (status === 503)
+    return "Model is loading (503).";
+  return raw || `HF request failed (${status})`;
+}
+
+async function requestHfImage(url, prompt, apiKey) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey || process.env.HF_API_KEY}`,
+      "Content-Type": "application/json",
+      Accept: "image/png",
+    },
+    body: JSON.stringify({
+      inputs: prompt,
+      parameters: {
+        negative_prompt:
+          "blurry, low quality, distorted, deformed, watermark, text",
+      },
+      options: {
+        wait_for_model: true,
+      },
+    }),
+  });
+
+  const contentType = response.headers.get("content-type") || "";
+
+  if (response.ok && contentType.startsWith("image/")) {
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const mimeType = contentType.split(";")[0] || "image/png";
+    return {
+      ok: true,
+      imageDataUrl: `data:${mimeType};base64,${buffer.toString("base64")}`,
+      mimeType,
+    };
+  }
+
+  // Some providers return an image base64 inside JSON instead of raw bytes.
+  if (response.ok && contentType.includes("application/json")) {
+    const data = await response.json().catch(() => null);
+    const b64 =
+      data?.image ||
+      (Array.isArray(data) && data[0]?.b64_json) ||
+      data?.b64_json ||
+      data?.data?.[0]?.b64_json;
+    if (b64) {
+      return {
+        ok: true,
+        imageDataUrl: `data:image/png;base64,${b64}`,
+        mimeType: "image/png",
+      };
+    }
+  }
+
+  const errorText = await response.text().catch(() => "");
+  return {
+    ok: false,
+    status: response.status,
+    // 503 = model still loading (worth a retry on the same host).
+    retryable: response.status === 503,
+    // 404 = try a different host/model instead of retrying the same one.
+    error: describeHfFailure(response.status, errorText),
+  };
+}
+
 app.post("/generate-image", async (req, res) => {
   try {
     const { prompt } = req.body;
@@ -829,74 +833,118 @@ app.post("/generate-image", async (req, res) => {
       });
     }
 
-    if (!process.env.HF_API_KEY) {
+    const hfKeys = getKeyPool("HF");
+    if (!hfKeys.length) {
       return res.status(500).json({
-        error: "HF_API_KEY missing in .env",
+        error:
+          "HF_API_KEY missing in server/.env. Add a Hugging Face token (https://huggingface.co/settings/tokens) — you can add HF_API_KEY_1, HF_API_KEY_2 ... for multiple — and restart the server.",
       });
     }
 
     const cleanPrompt = prompt.trim();
+    let lastError = "Hugging Face image generation failed";
+    let allKeysExhausted = true;
 
-    const model =
-      process.env.HF_IMAGE_MODEL ||
-      "stabilityai/stable-diffusion-xl-base-1.0";
+    // Rotate keys as the outer loop: if one token is invalid or rate-limited,
+    // move straight to the next token instead of failing the whole request.
+    const startKey = nextKeyIndex("HF", hfKeys.length);
 
-    const response = await fetch(
-      `https://router.huggingface.co/hf-inference/models/${model}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.HF_API_KEY}`,
-          "Content-Type": "application/json",
-          Accept: "image/png",
-        },
-        body: JSON.stringify({
-          inputs: cleanPrompt,
-          parameters: {
-            negative_prompt:
-              "blurry, low quality, distorted, deformed, watermark, text",
-          },
-          options: {
-            wait_for_model: true,
-          },
-        }),
+    for (let ki = 0; ki < hfKeys.length; ki++) {
+      const apiKey = hfKeys[(startKey + ki) % hfKeys.length];
+      const keyLabel = `key ${((startKey + ki) % hfKeys.length) + 1}/${hfKeys.length}`;
+      let skipKey = false;
+
+      // 1) Preferred path: HF Inference Providers (OpenAI-compatible images API).
+      for (const { provider, model } of HF_IMAGE_PROVIDERS) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const result = await requestHfProviderImage(provider, model, cleanPrompt, apiKey);
+
+          if (result.ok) {
+            return res.json({
+              success: true,
+              prompt: cleanPrompt,
+              imageDataUrl: result.imageDataUrl,
+              mimeType: result.mimeType,
+              provider: `Hugging Face (${provider})`,
+              model,
+              sourceUrl: "https://huggingface.co/settings/tokens",
+            });
+          }
+
+          lastError = result.error;
+          console.log(`HF IMAGE ERROR [${keyLabel}] [${provider}/${model}]:`, result.status, result.error);
+
+          // 401 (bad token) / 429 (rate limited) → this key is done, next key.
+          // 402/403 (provider not enabled or gated for this token) → try the
+          // next provider with the same key instead of abandoning it.
+          if ([401, 429].includes(result.status)) {
+            skipKey = true;
+            break;
+          }
+
+          allKeysExhausted = false;
+
+          if (result.retryable && attempt === 0) {
+            await sleep(3000);
+            continue;
+          }
+          break;
+        }
+
+        if (skipKey) break;
       }
-    );
 
-    const contentType = response.headers.get("content-type") || "";
+      // 2) Legacy fallback: classic serverless / hf-inference task endpoints
+      // (mostly deprecated now, but harmless to try as a last resort).
+      if (!skipKey) {
+        for (const model of HF_IMAGE_MODELS) {
+          for (const buildUrl of HF_IMAGE_HOSTS) {
+            const url = buildUrl(model);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.log("HF IMAGE ERROR:", errorText);
+            for (let attempt = 0; attempt < 2; attempt++) {
+              const result = await requestHfImage(url, cleanPrompt, apiKey);
 
-      return res.status(response.status).json({
-        error: errorText || "Hugging Face image generation failed",
-      });
+              if (result.ok) {
+                return res.json({
+                  success: true,
+                  prompt: cleanPrompt,
+                  imageDataUrl: result.imageDataUrl,
+                  mimeType: result.mimeType,
+                  provider: "Hugging Face",
+                  model,
+                  sourceUrl: "https://huggingface.co/settings/tokens",
+                });
+              }
+
+              lastError = result.error;
+              console.log(`HF IMAGE ERROR [${keyLabel}] [${model}]:`, result.status, result.error);
+
+              if ([401, 403, 429].includes(result.status)) {
+                skipKey = true;
+                break;
+              }
+
+              allKeysExhausted = false;
+
+              if (result.retryable && attempt === 0) {
+                await sleep(3000);
+                continue;
+              }
+              break;
+            }
+
+            if (skipKey) break;
+          }
+
+          if (skipKey) break;
+        }
+      }
     }
 
-    if (!contentType.startsWith("image/")) {
-      const text = await response.text();
-      console.log("HF NON IMAGE RESPONSE:", text);
-
-      return res.status(500).json({
-        error: "Hugging Face did not return an image. Try again later.",
-      });
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    const mimeType = contentType.split(";")[0] || "image/png";
-    const imageDataUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
-
-    res.json({
-      success: true,
-      prompt: cleanPrompt,
-      imageDataUrl,
-      mimeType,
-      provider: "Hugging Face",
-      model,
-      sourceUrl: "https://huggingface.co/settings/tokens",
+    // If every key was rejected on auth/limit, surface that clearly (401);
+    // otherwise it was a model/availability failure (502).
+    return res.status(allKeysExhausted ? 401 : 502).json({
+      error: `Image generation failed. ${lastError}`,
     });
   } catch (error) {
     console.log("IMAGE GENERATION ERROR:", error.message);
@@ -1158,9 +1206,13 @@ function buildFallbackPlan(selectedModel = "", hasImage = false) {
     }
   };
 
-  // Image vision should start with Gemini only, then text models if Gemini fails.
+  // Image vision: try Gemini, then Groq's multimodal models. We deliberately
+  // do NOT fall back to text-only models here — they would hallucinate "I can't
+  // see the image" instead of analyzing it.
   if (hasImage) {
     add("Gemini", "gemini-2.5-flash");
+    GROQ_VISION_MODELS.forEach((m) => add("Groq", m));
+    return plan;
   } else if (groqModels.includes(normalized)) {
     add("Groq", normalized);
   } else if (geminiModels.includes(normalized)) {
@@ -1202,14 +1254,14 @@ function isRetryableAIError(error) {
 
 async function callModelByProvider(item, safeMessages, systemPrompt, imageData = null) {
   if (item.provider === "Groq") {
-    return await callGroq(item.model, safeMessages, systemPrompt);
+    return await callGroq(item.model, safeMessages, systemPrompt, imageData);
   }
 
   if (item.provider === "Gemini") {
     return await callGemini(item.model, safeMessages, systemPrompt, imageData);
   }
 
-  return await callOpenRouter(item.model, safeMessages, systemPrompt);
+  return await callOpenRouter(item.model, safeMessages, systemPrompt, imageData);
 }
 
 async function generateWithFallback(selectedModel, safeMessages, systemPrompt, imageData = null) {
@@ -1276,13 +1328,13 @@ function buildStreamingFallbackPlan(selectedModel = "") {
   return plan;
 }
 
-function buildStreamingRequest(item, safeMessages, systemPrompt) {
+function buildStreamingRequest(item, safeMessages, systemPrompt, apiKey) {
   if (item.provider === "Groq") {
     return {
       apiUrl: "https://api.groq.com/openai/v1/chat/completions",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        Authorization: `Bearer ${apiKey || process.env.GROQ_API_KEY}`,
       },
       body: {
         model: item.model,
@@ -1298,7 +1350,7 @@ function buildStreamingRequest(item, safeMessages, systemPrompt) {
     apiUrl: "https://openrouter.ai/api/v1/chat/completions",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      Authorization: `Bearer ${apiKey || process.env.OPENROUTER_API_KEY}`,
       "HTTP-Referer": "http://localhost:5173",
       "X-Title": "SYNEZ AI",
     },
@@ -1317,28 +1369,6 @@ function buildStreamingRequest(item, safeMessages, systemPrompt) {
    PHASE 4.1 WEBSITE ARCHITECT ENGINE
    Intent -> Plan -> Design System -> Focused Prompt
 ========================= */
-
-function isWebsiteBuildRequest(text = "") {
-  const t = String(text || "").toLowerCase();
-
-  // Project/app/clone prompts must never fall into Website Architect.
-  if (isProjectBuildRequest(t)) return false;
-
-  const buildWords =
-    /(build|create|make|generate|design|code|develop|ban[aao]|banao|bnao|bnado|website|webpage|landing page|homepage|site)/i;
-
-  const websiteWords =
-    /(website|web page|webpage|landing page|homepage|site|portfolio website|saas page|landing|frontend page)/i;
-
-  const codeIntent =
-    /(html|css|javascript|js|responsive|navbar|hero|section|cards|glassmorphism|bento|animation)/i;
-
-  return (
-    (buildWords.test(t) && websiteWords.test(t)) ||
-    (websiteWords.test(t) && codeIntent.test(t)) ||
-    /(build me|create me|make me|generate me).*(website|site|webpage|landing page|homepage|portfolio website)/i.test(t)
-  );
-}
 
 function detectWebsiteType(text = "") {
   const t = String(text).toLowerCase();
@@ -1465,8 +1495,8 @@ CRITICAL RULES:
 - Do NOT say "I am SYNEZ AI".
 - Build a premium website, not a basic template.
 - Output must be preview-ready.
-- Use no external libraries unless the user explicitly asks.
-- Do not use external CSS files, script files, image files, or icon libraries. Everything must work inside the three returned code blocks.
+- Use no external JS/CSS libraries unless the user explicitly asks. All CSS goes in the css block, all JS in the js block.
+- You MAY use remote image URLs (https://picsum.photos, https://source.unsplash.com) and a Google Fonts <link> in the HTML <head> to make the site look premium. Do NOT use icon-font libraries (Font Awesome); use inline SVG or emoji for icons.
 - Return exactly 3 fenced code blocks: html, css, javascript.
 - The code must work directly in an iframe srcDoc preview.
 - Avoid broken attributes. Use valid HTML.
@@ -1574,10 +1604,12 @@ function buildTaskAwareFallbackPlan(selectedModel = "", taskType = "chat", hasIm
 
   if (hasImage) {
     add("Gemini", "gemini-2.5-flash");
+    GROQ_VISION_MODELS.forEach((m) => add("Groq", m));
+    return plan;
   }
 
-  if (taskType === "website") {
-    // Best quality first. 8B should be emergency-only for premium website generation.
+  if (taskType === "website" || taskType === "project" || taskType === "coding") {
+    // Best quality first. 8B should be emergency-only for premium generation.
     add("Groq", "llama-3.3-70b-versatile");
     add("Gemini", "gemini-2.5-flash");
 
@@ -2636,150 +2668,6 @@ async function generateWebsiteWithQualityEngine({
 
 
 
-/* =========================
-   PHASE 7.0 MASTER AI ORCHESTRATOR
-   One prompt = one engine. This classifier is deterministic and does not call an AI model.
-========================= */
-
-const MASTER_INTENTS_V7 = new Set([
-  "runtime-self-heal",
-  "project-memory",
-  "coding-agent",
-  "architecture",
-  "website",
-  "image-edit",
-  "image-generation",
-  "document-reader",
-  "quick-info",
-  "web-search",
-  "chat",
-]);
-
-function normalizeIntentTextV7(text = "") {
-  return String(text || "")
-    .replace(/Uploaded attachments:[\s\S]*$/i, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function classifyMasterIntentV7(text = "", context = {}) {
-  const t = normalizeIntentTextV7(text);
-  const hasImages = Boolean(context.hasImages || context.imageCount > 0 || hasImagePayload(context.imageData));
-  const hasDocuments = Boolean(context.hasDocuments || context.fileCount > 0);
-  const explicitTask = String(context.explicitTask || "").toLowerCase();
-  const scores = {
-    "runtime-self-heal": 0,
-    "project-memory": 0,
-    "coding-agent": 0,
-    architecture: 0,
-    website: 0,
-    "image-edit": 0,
-    "image-generation": 0,
-    "document-reader": 0,
-    "quick-info": 0,
-    "web-search": 0,
-    chat: 1,
-  };
-  const reasons = [];
-  const add = (intent, points, reason) => {
-    scores[intent] += points;
-    if (reason) reasons.push({ intent, points, reason });
-  };
-
-  // Explicit route locks always win and are used by regenerate/retry.
-  if (MASTER_INTENTS_V7.has(explicitTask)) {
-    add(explicitTask, 1000, "Explicit task lock supplied by the client");
-  }
-
-  const runtimeExplicit = /runtime self[-\s]?healing|self[-\s]?heal(?:ing)? preview|runtime repair engine|use only the runtime/i.test(t);
-  const runtimeEvidence = /preview (?:has )?(?:crashed|failed|broken|blank)|blank preview|runtime (?:error|failure|crash)|vite (?:error|failed)|react (?:runtime )?error|console error|failed to compile|cannot resolve|is not defined|unexpected token|build error/i.test(t);
-  const runtimeAction = /inspect|repair|heal|fix|recover|rebuild|reload|verify/i.test(t);
-  if (runtimeExplicit) add("runtime-self-heal", 160, "Explicit Runtime Self-Healing request");
-  if (runtimeEvidence && runtimeAction) add("runtime-self-heal", 95, "Runtime evidence plus repair/inspection action");
-
-  const memoryScope = /project memory|remember(?:ed)? project|active workspace|save (?:the )?(?:current )?project|restore snapshot|project snapshot|latest snapshot/i.test(t);
-  if (memoryScope) add("project-memory", 135, "Project-memory or snapshot request");
-
-  const analyzeIntent = /\b(analyze|analyse|inspect|review|audit|dependency graph|project health|production readiness|engineering report|find bugs|debug|refactor|optimi[sz]e|broken imports?|missing imports?|codebase)\b/i.test(t);
-  const currentProjectScope = /\b(current|existing|uploaded|remembered|this|entire|whole|complete)\s+(project|codebase)|project files|current synez/i.test(t);
-  const applyFixIntent = /automatically fix|auto fix|apply (?:the )?fix|repair all|edit only|required files|refactor this project/i.test(t);
-  if (analyzeIntent && currentProjectScope) add("coding-agent", 120, "Existing-project analysis or repair request");
-  if (applyFixIntent) add("coding-agent", 35, "Explicit multi-file repair intent");
-
-  const buildVerb = /\b(build|create|generate|develop|make|banao|bnao|bnado)\b/i.test(t);
-  const projectObject = /\b(app|application|platform|workspace|dashboard|portal|clone|full[-\s]?stack|complete multi[-\s]?file|react project|vite project|software project|system)\b/i.test(t);
-  const websiteObject = /\b(website|webpage|landing page|homepage)\b/i.test(t);
-  const negativeBuild = /do not (?:generate|build|create)|not a website generation request|not a project architecture request/i.test(t);
-  if (buildVerb && projectObject && !negativeBuild && !analyzeIntent) add("architecture", 115, "New application/project generation request");
-  if (buildVerb && websiteObject && !projectObject && !negativeBuild && !analyzeIntent) add("website", 105, "Standalone website generation request");
-
-  const imageEditWords = /\b(edit|replace background|change background|blur background|remove background|remove object|object removal|retouch|inpaint|enhance photo|color correct|colour correct)\b/i.test(t);
-  if (hasImages && imageEditWords) add("image-edit", 145, "Uploaded image plus direct edit instruction");
-  const imageGenWords = /\b(generate|create|make|draw|render)\b[\s\S]{0,30}\b(image|photo|poster|logo|wallpaper|artwork)\b/i.test(t);
-  if (!hasImages && imageGenWords) add("image-generation", 100, "Text-to-image generation request");
-
-  const readerWords = /\b(read|summarize|summarise|explain|extract|compare|analyze|analyse)\b[\s\S]{0,40}\b(document|pdf|docx|txt|markdown|file|attachments?)\b/i.test(t);
-  if (hasDocuments && (readerWords || !t)) add("document-reader", 140, "Uploaded document reading request");
-
-  const quickInfoWords = /\b(weather|mausam|temperature|forecast|humidity|wind|current time|today'?s date|today date|aaj ka date|aaj ka time|latest news|today'?s news|aaj ki news|khabar|samachar)\b/i.test(t);
-  const engineeringContext = /runtime|project|codebase|dependency|build|preview|architecture|fix time|latest dependencies/i.test(t);
-  if (quickInfoWords && !engineeringContext && !buildVerb) add("quick-info", 110, "Explicit live date/time/weather/news request");
-
-  const freshInfoWords = /\b(latest|current|today|yesterday|recent|price|score|winner|news|update)\b/i.test(t);
-  const explicitSearch = /\b(search the web|web search|look up|find online|sources|cite sources)\b/i.test(t);
-  if ((explicitSearch || freshInfoWords) && !buildVerb && !analyzeIntent && !quickInfoWords) add("web-search", explicitSearch ? 85 : 45, "Fresh/public-information request");
-
-  // Strong mutual-exclusion penalties.
-  if (runtimeExplicit || (runtimeEvidence && runtimeAction)) {
-    scores.architecture -= 180;
-    scores.website -= 180;
-    scores["quick-info"] -= 120;
-  }
-  if (analyzeIntent && currentProjectScope) {
-    scores.architecture -= 150;
-    scores.website -= 150;
-    scores["quick-info"] -= 100;
-  }
-  if (buildVerb && (projectObject || websiteObject) && !negativeBuild) {
-    scores["quick-info"] -= 160;
-    scores["coding-agent"] -= analyzeIntent ? 0 : 80;
-    scores["runtime-self-heal"] -= runtimeExplicit ? 0 : 100;
-  }
-
-  const order = [
-    "runtime-self-heal",
-    "project-memory",
-    "image-edit",
-    "document-reader",
-    "coding-agent",
-    "architecture",
-    "website",
-    "quick-info",
-    "web-search",
-    "image-generation",
-    "chat",
-  ];
-  const ranked = order
-    .map((intent) => ({ intent, score: scores[intent] }))
-    .sort((a, b) => b.score - a.score || order.indexOf(a.intent) - order.indexOf(b.intent));
-  const winner = ranked[0];
-  const second = ranked[1];
-  const positiveReasons = reasons
-    .filter((item) => item.intent === winner.intent && item.points > 0)
-    .sort((a, b) => b.points - a.points)
-    .map((item) => item.reason);
-
-  return {
-    intent: winner.intent,
-    confidence: Math.max(1, Math.min(100, Math.round(55 + (winner.score - second.score) / 2))),
-    reason: positiveReasons[0] || "General conversation fallback",
-    scores,
-    ranked: ranked.slice(0, 4),
-    version: "7.0",
-  };
-}
-
 app.post("/orchestrate", (req, res) => {
   try {
     const { prompt = "", context = {}, explicitTask = "" } = req.body || {};
@@ -2794,45 +2682,6 @@ app.post("/orchestrate", (req, res) => {
    PHASE 5.1 PROJECT ARCHITECT CORE
    Project intent -> Architecture plan -> File tree -> Multi-file rules
 ========================= */
-
-function isProjectBuildRequest(text = "") {
-  const t = String(text || "").toLowerCase();
-
-  // Known app/clone keywords are always project mode.
-  if (/(netflix|spotify|youtube|instagram|whatsapp|uber|zomato|amazon|flipkart|twitter|x clone|facebook|discord|telegram|notion|trello|slack).*clone/i.test(t)) return true;
-  if (/(clone).*(netflix|spotify|youtube|instagram|whatsapp|uber|zomato|amazon|flipkart|twitter|facebook|discord|telegram|notion|trello|slack)/i.test(t)) return true;
-
-  const buildIntent = /(build|create|make|generate|develop|code|banao|bnao|bnado)/i.test(t);
-  const projectWords =
-    /(clone|app|application|platform|workspace|ai workspace|system|dashboard|portal|full project|complete project|multi[-\s]?file|react project|vite project|node project|full stack|frontend project|backend project|spotify|netflix|youtube|instagram|whatsapp|todo app|chat app|ecommerce app|crm|lms|portfolio app)/i.test(t);
-
-  const pureWebsiteOnly =
-    /(website|landing page|homepage|webpage)/i.test(t) &&
-    !/(react|vite|full stack|backend|node|express|database|auth|dashboard|app|clone|multi[-\s]?file|project|platform|system)/i.test(t);
-
-  return buildIntent && projectWords && !pureWebsiteOnly;
-}
-
-function isRuntimeSelfHealRequest(text = "") {
-  const t = String(text || "").toLowerCase().trim();
-  if (!t) return false;
-
-  const explicitEngine = /runtime self[-\s]?healing|self[-\s]?heal(?:ing)? preview|runtime repair engine/i.test(t);
-  const runtimeFailure = /preview (?:has )?(?:crashed|failed|broken|blank)|blank preview|runtime (?:error|failure|crash)|vite (?:error|failed)|react (?:runtime )?error|console error|failed to compile|cannot resolve|is not defined|unexpected token/i.test(t);
-  const repairIntent = /repair|heal|fix|recover|rebuild preview|reload preview|verify (?:the )?(?:repair|preview)/i.test(t);
-  const projectScope = /current (?:running )?project|currently loaded project|remembered project|project files|codebase|preview|runtime/i.test(t);
-
-  return explicitEngine || (runtimeFailure && (repairIntent || projectScope));
-}
-
-function detectTaskType(text = "", explicitTask = "") {
-  const result = classifyMasterIntentV7(text, { explicitTask });
-  if (result.intent === "architecture") return "project";
-  if (result.intent === "website") return "website";
-  if (result.intent === "runtime-self-heal") return "runtime-self-heal";
-  if (result.intent === "image-generation") return "image";
-  return "chat";
-}
 
 function detectProjectType(text = "") {
   const t = String(text || "").toLowerCase();
@@ -3091,6 +2940,104 @@ Do not output full code in this planning response.`;
 }
 
 
+// Strict prompt that makes the model emit a complete, prompt-tailored
+// React + Vite multi-file project. The file header format ("File: <path>")
+// followed by a fenced code block matches the client project-file parser.
+function composeProjectGeneratePrompt(userPrompt = "") {
+  const plan = buildProjectArchitecturePlan(userPrompt);
+
+  return `You are SYNEZ AI Project Generator Engine.
+
+TASK: Generate a COMPLETE, working React + Vite multi-file project for the user's request below. Output real, tailored code — never a generic todo template unless the user asked for a todo app.
+
+USER REQUEST:
+${userPrompt}
+
+PROJECT PLAN:
+Type: ${plan.type}
+Stack: React + Vite
+
+CRITICAL OUTPUT RULES:
+- Do NOT introduce yourself. Start with one short line: "Here is your React + Vite project:".
+- Split the app into SEPARATE component files under src/components/ (Navbar, Hero, Footer and feature-specific components). Do NOT put everything in App.jsx.
+- Each file MUST be output in EXACTLY this format: a line "File: <path>" immediately followed by a fenced code block whose language tag matches the file (jsx, js, css, json, or html):
+
+File: src/App.jsx
+\`\`\`jsx
+...full file code...
+\`\`\`
+
+- Include ALL of these files, in this order:
+  1. File: package.json (valid JSON, with react, react-dom, vite, @vitejs/plugin-react)
+  2. File: index.html (has <div id="root"></div> and <script type="module" src="/src/main.jsx"></script>)
+  3. File: src/main.jsx (imports React, ReactDOM, App and calls ReactDOM.createRoot(...).render(...))
+  4. File: src/App.jsx (imports and composes the components; must contain a real return( ... ) with JSX)
+  5. File: src/App.css (all styling for the app)
+  6. Several files under src/components/*.jsx (one component per file)
+  7. If useful, File: src/data/mockData.js with mock content
+
+- Every component must be self-contained and import what it needs from React.
+- Use only "react" and "react-dom". Do NOT import external UI/icon libraries. For icons use inline SVG or emoji. For images use https://picsum.photos or https://source.unsplash.com URLs.
+- Keep JSX valid and directly runnable in a Vite React app.
+- Do NOT wrap the whole answer in one giant code block. Each file is its own block.
+- Do NOT output a file tree, architecture headings, or "Reply GENERATE". Output only the intro line and the files.
+
+DESIGN QUALITY (make it look AWESOME, like a premium 2024 product site):
+- Aim for a striking, modern hero section: large bold headline, gradient or dark theme, a clear CTA button.
+- Use a real, considered color palette (2-3 accent colors + neutrals) via CSS variables in :root. Add smooth gradients and subtle shadows.
+- Use generous spacing, rounded corners (12-24px), and a clean sans-serif font stack. You may add a Google Fonts <link> in index.html.
+- Add tasteful micro-interactions: hover transforms, transitions (transition: all .2s ease), focus states.
+- Make it fully responsive with CSS grid/flex and @media breakpoints (mobile-first).
+- Build multiple real sections (navbar, hero, features/cards, gallery or content, testimonials/stats, footer) with realistic tailored copy — never lorem ipsum, never empty placeholders.
+- Prefer a cohesive dark or glassmorphism aesthetic when it fits the request; keep contrast accessible.
+- The result should feel finished and portfolio-worthy, not a skeleton.`;
+}
+
+// Generates a tailored React multi-file project via the AI, with a deterministic
+// starter as a safety net if the model output is empty or malformed.
+async function generateReactProjectReply({ selectedModel, buildPrompt, userName, userEmail }) {
+  const systemPrompt = createSystemPrompt(userName || "User", userEmail || "guest");
+  const genMessages = [
+    { role: "user", content: composeProjectGeneratePrompt(buildPrompt) },
+  ];
+
+  try {
+    const result = await generateWithTaskAwareFallback(
+      selectedModel,
+      genMessages,
+      systemPrompt,
+      null,
+      "project"
+    );
+
+    const reply = stripRepeatedIdentityIntro(result.reply || "");
+    const looksLikeProject =
+      /File:\s*src\/App\.jsx/i.test(reply) &&
+      /```(jsx|tsx|js|javascript|json|css|html)/i.test(reply) &&
+      reply.length > 400;
+
+    if (looksLikeProject) {
+      return {
+        reply,
+        provider: result.fallbackUsed
+          ? `${result.provider} Auto Fallback`
+          : result.provider,
+        model: result.model,
+        fallbackUsed: result.fallbackUsed,
+      };
+    }
+  } catch (error) {
+    console.log("PROJECT GEN ERROR:", error.message);
+  }
+
+  return {
+    reply: buildStarterProjectFilesResponse(buildPrompt),
+    provider: "SYNEZ AI",
+    model: "Deterministic Project Generator (fallback)",
+  };
+}
+
+
 function buildProjectArchitectureResponse(userPrompt = "") {
   const plan = buildProjectArchitecturePlan(userPrompt);
   const tree = formatFileTree(plan.files);
@@ -3205,19 +3152,6 @@ Reply **GENERATE** and I will create the first version of this project as multi-
 }
 
 
-
-function isGenerateProjectRequest(text = "") {
-  return /^(generate|generate files|generate project|create files|start generation|build files)$/i.test(
-    String(text || "").trim()
-  );
-}
-
-
-function isGenerateProjectRequest(text = "") {
-  return /^(generate|generate files|generate project|create files|start generation|build files)$/i.test(
-    String(text || "").trim()
-  );
-}
 
 function buildStarterProjectFilesResponse(userPrompt = "") {
   return `# Project Files — React + Vite Todo App
@@ -4619,10 +4553,24 @@ app.post("/chat", async (req, res) => {
     }
 
     if (isGenerateProjectRequest(lastUserMessage)) {
+      // "GENERATE" refers to the previous build request in the conversation.
+      const userTurns = safeMessages.filter((m) => m.role === "user");
+      const buildPrompt =
+        userTurns.length >= 2
+          ? userTurns[userTurns.length - 2].content
+          : lastUserMessage;
+
+      const projectResult = await generateReactProjectReply({
+        selectedModel,
+        buildPrompt,
+        userName,
+        userEmail,
+      });
+
       return res.json({
-        reply: buildStarterProjectFilesResponse(lastUserMessage),
-        provider: "SYNEZ AI",
-        model: "Deterministic Project Generator",
+        reply: projectResult.reply,
+        provider: projectResult.provider,
+        model: projectResult.model,
         task: "project-generate",
         orchestrator: orchestration,
       });
@@ -4650,12 +4598,20 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // Project architecture is local and must happen before any AI call or website fallback.
+    // Project mode now generates tailored React multi-file code directly
+    // (one step) instead of only returning an architecture plan.
     if (isProjectMode) {
+      const projectResult = await generateReactProjectReply({
+        selectedModel,
+        buildPrompt: lastUserMessage,
+        userName,
+        userEmail,
+      });
+
       return res.json({
-        reply: buildProjectArchitectureResponse(lastUserMessage),
-        provider: "SYNEZ AI",
-        model: "Project Architect Engine",
+        reply: projectResult.reply,
+        provider: projectResult.provider,
+        model: projectResult.model,
         task: "project",
         orchestrator: orchestration,
       });
@@ -4721,6 +4677,59 @@ app.post("/chat", async (req, res) => {
       provider: "Error",
       model: "Error",
     });
+  }
+});
+
+/* =========================
+   AUTO CHAT TITLE
+========================= */
+
+function fallbackTitleFromText(text = "") {
+  const clean = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return "New Chat";
+  return clean.length > 40 ? `${clean.slice(0, 40).trim()}…` : clean;
+}
+
+app.post("/generate-title", async (req, res) => {
+  try {
+    const message = String(req.body?.message || "").slice(0, 1500).trim();
+
+    if (!message) {
+      return res.json({ title: "New Chat" });
+    }
+
+    const titlePrompt =
+      "You generate a very short chat title (3 to 6 words) that summarizes the user's request. " +
+      "Return ONLY the title text — no quotes, no punctuation at the end, no prefixes like 'Title:'.";
+
+    let title = "";
+    try {
+      title = await callGroq(
+        "llama-3.1-8b-instant",
+        [{ role: "user", content: `Message: "${message}"\n\nShort title:` }],
+        titlePrompt
+      );
+    } catch (error) {
+      console.log("TITLE GEN ERROR:", error.message);
+    }
+
+    title = String(title || "")
+      .replace(/^["'`\s]+|["'`\s.]+$/g, "")
+      .replace(/^title[:\-\s]+/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // Keep it tight and always non-empty.
+    if (!title || title.length > 60) {
+      title = fallbackTitleFromText(title || message);
+    }
+
+    res.json({ title });
+  } catch (error) {
+    console.error("Generate Title Error:", error.message);
+    res.json({ title: fallbackTitleFromText(req.body?.message) });
   }
 });
 
@@ -4802,30 +4811,47 @@ app.post("/chat-stream", async (req, res) => {
     let fallbackCount = 0;
 
     for (const item of plan) {
-      try {
-        const request = buildStreamingRequest(item, modelMessages, systemPrompt);
+      // Try every key in this provider's pool before moving to the next model,
+      // so a single rate-limited key doesn't drop the whole request.
+      const poolProvider = item.provider === "Groq" ? "Groq" : "OpenRouter";
+      const keys = getKeyPool(poolProvider);
+      const keyList = keys.length ? keys : [undefined];
+      const startKey = nextKeyIndex(poolProvider, keyList.length);
+      let switchedModel = false;
 
-        const trialResponse = await fetch(request.apiUrl, {
-          method: "POST",
-          headers: request.headers,
-          body: JSON.stringify(request.body),
-        });
+      for (let k = 0; k < keyList.length; k++) {
+        const apiKey = keyList[(startKey + k) % keyList.length];
 
-        if (!trialResponse.ok || !trialResponse.body) {
-          lastErrorText = await trialResponse.text();
-          console.log(`STREAM AI FAIL: ${item.provider} -> ${item.model}:`, lastErrorText);
-          fallbackCount += 1;
-          continue;
+        try {
+          const request = buildStreamingRequest(item, modelMessages, systemPrompt, apiKey);
+
+          const trialResponse = await fetch(request.apiUrl, {
+            method: "POST",
+            headers: request.headers,
+            body: JSON.stringify(request.body),
+          });
+
+          if (!trialResponse.ok || !trialResponse.body) {
+            lastErrorText = await trialResponse.text();
+            console.log(`STREAM AI FAIL: ${item.provider} -> ${item.model} (key ${(startKey + k) % keyList.length + 1}/${keyList.length}):`, lastErrorText);
+            // Rotate to the next key only for rate-limit/auth errors; otherwise move on to the next model.
+            if (KEY_ROTATE_STATUS.has(trialResponse.status)) continue;
+            switchedModel = true;
+            fallbackCount += 1;
+            break;
+          }
+
+          response = trialResponse;
+          selectedItem = item;
+          break;
+        } catch (error) {
+          lastErrorText = error.message;
+          console.log(`STREAM AI FAIL: ${item.provider} -> ${item.model}:`, error.message);
         }
-
-        response = trialResponse;
-        selectedItem = item;
-        break;
-      } catch (error) {
-        lastErrorText = error.message;
-        console.log(`STREAM AI FAIL: ${item.provider} -> ${item.model}:`, error.message);
-        fallbackCount += 1;
       }
+
+      if (response) break;
+      if (!switchedModel) fallbackCount += 1;
     }
 
     if (!response || !selectedItem) {
@@ -4980,10 +5006,19 @@ app.post("/read-document", upload.single("file"), async (req, res) => {
     let text = "";
     let reader = "text";
 
+    console.log(`READ DOCUMENT: "${file.originalname}" (${mime || "?"}, ${file.size} bytes)`);
+
     if (/\.pdf$/i.test(name) || mime.includes("pdf")) {
       reader = "pdf-parse";
-      const data = await pdfParse(file.buffer, { max: 0 });
-      text = data.text || "";
+      try {
+        const data = await pdfParse(file.buffer, { max: 0 });
+        text = data.text || "";
+      } catch (pdfError) {
+        console.log("PDF PARSE ERROR:", pdfError.message);
+        return res.status(422).json({
+          error: `Could not parse this PDF (${pdfError.message}). It may be corrupted, password-protected, or a scanned image with no selectable text.`,
+        });
+      }
     } else if (/\.docx$/i.test(name) || mime.includes("wordprocessingml")) {
       reader = "mammoth-docx";
       const result = await mammoth.extractRawText({ buffer: file.buffer });
@@ -5745,10 +5780,21 @@ app.get("/software-engineer/history", (req, res) => {
   return res.json({ success: true, plans });
 });
 
+/* 🚀 DEPLOYMENT — PORT: hosts (Render/Railway/etc.) inject process.env.PORT
+   automatically. Keep this as-is; do NOT hardcode 5000 on the host. */
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
   console.log(`SYNEZ AI server running on port ${PORT}`);
+
+  ["Groq", "Gemini", "OpenRouter", "HF"].forEach((provider) => {
+    const count = getKeyPool(provider).length;
+    console.log(
+      count > 0
+        ? `${provider} keys loaded ✅ (${count})`
+        : `${provider} API key missing ❌`
+    );
+  });
 
   if (SERPER_KEYS.length > 0) {
     console.log(`SERPER keys loaded ✅ (${SERPER_KEYS.length})`);
