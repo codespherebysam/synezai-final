@@ -1,7 +1,8 @@
-/** Google Gemini — chat, streaming and vision through the native REST API. */
+/** Google Gemini — chat, vision and image generation through the native REST API. */
 
 import { request } from "../core/http.js";
 import { withKeys, hasKeys } from "../core/keys.js";
+import { log } from "../core/log.js";
 
 const BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -39,8 +40,15 @@ const model = (kind) =>
     ? (process.env.GEMINI_VISION_MODEL ?? process.env.GEMINI_MODEL ?? "gemini-2.0-flash")
     : (process.env.GEMINI_MODEL ?? "gemini-2.0-flash");
 
+const imageModels = () =>
+  (process.env.GEMINI_IMAGE_MODELS ?? "gemini-2.5-flash-image,gemini-2.0-flash-preview-image-generation")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
 async function generate(messages, kind, temperature) {
   const { system, contents } = toGemini(messages);
+  if (!contents.length) throw new Error("gemini: no usable message content");
   return withKeys("GEMINI", async (key) => {
     const res = await request(`${BASE}/${model(kind)}:generateContent?key=${key}`, {
       method: "POST",
@@ -55,15 +63,48 @@ async function generate(messages, kind, temperature) {
     });
     const content =
       res?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+    if (!content) throw new Error("gemini: empty completion");
     return { content, model: model(kind) };
   });
 }
 
 export const gemini = {
   id: "gemini",
-  priority: 20,
-  capabilities: ["chat", "vision"],
+  priority: 15,
+  capabilities: ["chat", "vision", "image"],
   enabled: () => hasKeys("GEMINI"),
   chat: ({ messages, temperature = 0.7 }) => generate(messages, "chat", temperature),
   vision: ({ messages, temperature = 0.3 }) => generate(messages, "vision", temperature),
+
+  async image({ prompt }) {
+    const errors = [];
+    for (const m of imageModels()) {
+      try {
+        return await withKeys("GEMINI", async (key) => {
+          const res = await request(`${BASE}/${m}:generateContent?key=${key}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            retries: 0,
+            timeoutMs: 150_000,
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: prompt }] }],
+              generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
+            }),
+          });
+          const parts = res?.candidates?.[0]?.content?.parts ?? [];
+          const images = parts
+            .map((p) => p.inlineData ?? p.inline_data)
+            .filter(Boolean)
+            .map((d) => `data:${d.mimeType ?? d.mime_type ?? "image/png"};base64,${d.data}`);
+          if (!images.length) throw new Error("no inline image returned");
+          log.info("gemini", `image ok via ${m}`);
+          return { images, model: m };
+        });
+      } catch (err) {
+        errors.push(`${m}: ${err.message}`);
+        log.warn("gemini", `image failed ${m}`, err.message);
+      }
+    }
+    throw new Error(`gemini image failed → ${errors.join(" | ").slice(0, 400)}`);
+  },
 };

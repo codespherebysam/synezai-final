@@ -35,12 +35,18 @@ export function get(id) {
   return registry.get(id);
 }
 
+/** Sensible defaults so the strongest provider for a capability runs first. */
+const DEFAULT_ORDER = {
+  vision: ["gemini", "openrouter", "groq", "openai"],
+  image: ["gemini", "huggingface", "pollinations"],
+};
+
 function envOrder(capability) {
   // e.g. PROVIDER_ORDER_CHAT="groq,gemini,openrouter" or global PROVIDER_ORDER
   const raw =
     process.env[`PROVIDER_ORDER_${capability.toUpperCase()}`] ??
     process.env.PROVIDER_ORDER ??
-    "";
+    (DEFAULT_ORDER[capability.toLowerCase()] ?? []).join(",");
   return raw
     .split(",")
     .map((s) => s.trim().toLowerCase())

@@ -7,12 +7,36 @@ import { buildMessages, remember } from "../core/context.js";
 import { detectIntent, planFor, personaFor, nowContext } from "../core/router.js";
 import { extractText } from "../services/documents.js";
 import { groundedContext } from "../services/grounding.js";
+import { log, explain } from "../core/log.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 export const api = Router();
 
-const fail = (res, err) =>
-  res.status(err.status ?? 500).json({ error: err.message ?? "Unexpected error" });
+const fail = (res, err, scope = "api") => {
+  log.error(scope, "request failed", err?.stack ?? err?.message);
+  const message = explain(err);
+  res.status(err?.status ?? 500).json({ error: message, message, attempts: err?.attempts });
+};
+
+/** Accept every image field shape the clients send. */
+function collectImages(body = {}) {
+  const out = [];
+  const push = (v) => {
+    if (typeof v === "string" && v.trim()) out.push(v.trim());
+  };
+  push(body.image);
+  push(body.image_url);
+  for (const key of ["images", "image_urls", "imageUrls"]) {
+    if (Array.isArray(body[key])) body[key].forEach((v) => push(typeof v === "string" ? v : v?.url));
+  }
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) {
+      if (!Array.isArray(m?.content)) continue;
+      for (const part of m.content) if (part?.type === "image_url") push(part.image_url?.url);
+    }
+  }
+  return [...new Set(out)];
+}
 
 /* ------------------------------- health ------------------------------- */
 
@@ -36,8 +60,9 @@ api.get("/providers", (_req, res) =>
 /** One endpoint that picks the whole pipeline automatically. */
 api.post("/orchestrate", async (req, res) => {
   try {
-    const { prompt = "", message, sessionId, images = [], documents = [], preferred = [] } = req.body ?? {};
+    const { prompt = "", message, sessionId, documents = [], preferred = [] } = req.body ?? {};
     const text = prompt || message || "";
+    const images = collectImages(req.body ?? {});
     const intent = detectIntent({
       prompt: text,
       hasImage: images.length > 0,
@@ -86,7 +111,7 @@ api.post("/orchestrate", async (req, res) => {
 
     res.json({ intent, provider: out.provider, model: out.model, content: out.content, sources });
   } catch (err) {
-    fail(res, err);
+    fail(res, err, "orchestrate");
   }
 });
 
@@ -157,17 +182,22 @@ api.post("/chat-stream", async (req, res) => {
 
 api.post("/vision", async (req, res) => {
   try {
-    const { prompt = "Analyse this image.", images = [], sessionId, preferred = [] } = req.body ?? {};
-    if (!images.length) return res.status(400).json({ error: "images[] is required" });
+    const body = req.body ?? {};
+    const prompt = body.prompt || body.message || body.question || "Analyse this image.";
+    const { sessionId, preferred = [] } = body;
+    const images = collectImages(body);
+    if (!images.length)
+      return res.status(400).json({ error: "No image received. Send images[] as data URLs or https URLs." });
+    log.info("vision", `analysing ${images.length} image(s)`);
     const messages = buildMessages({ sessionId, system: personaFor("vision"), prompt });
     messages[messages.length - 1].content = [
       { type: "text", text: prompt },
       ...images.map((url) => ({ type: "image_url", image_url: { url } })),
     ];
     const out = await run("vision", { messages }, { preferred });
-    res.json({ content: out.content, provider: out.provider });
+    res.json({ content: out.content, answer: out.content, provider: out.provider, model: out.model });
   } catch (err) {
-    fail(res, err);
+    fail(res, err, "vision");
   }
 });
 
@@ -177,10 +207,19 @@ const imageHandler = async (req, res) => {
   try {
     const prompt = req.body?.prompt ?? req.body?.text ?? req.query?.prompt;
     if (!prompt) return res.status(400).json({ error: "prompt is required" });
+    log.info("image", `generating: ${String(prompt).slice(0, 120)}`);
     const out = await run("image", { prompt }, { preferred: req.body?.preferred ?? [] });
-    res.json({ images: out.images, image: out.images[0], url: out.images[0], provider: out.provider, model: out.model });
+    if (!out.images?.length) throw new Error("Image provider returned no image data.");
+    res.json({
+      images: out.images,
+      image: out.images[0],
+      url: out.images[0],
+      data: out.images[0],
+      provider: out.provider,
+      model: out.model,
+    });
   } catch (err) {
-    fail(res, err);
+    fail(res, err, "image");
   }
 };
 api.post("/generate-image", imageHandler);
@@ -204,13 +243,17 @@ api.post("/serper", searchHandler);
 
 /* ------------------------------ documents ------------------------------ */
 
-api.post("/read-document", upload.single("file"), async (req, res) => {
+api.post("/read-document", upload.any(), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: "file is required" });
-    const text = await extractText(req.file);
-    res.json({ name: req.file.originalname, text, content: text, chars: text.length });
+    const file = req.file ?? req.files?.[0];
+    if (!file)
+      return res
+        .status(400)
+        .json({ error: "No file received. Upload it as multipart/form-data." });
+    const text = await extractText(file);
+    res.json({ name: file.originalname, text, content: text, chars: text.length });
   } catch (err) {
-    fail(res, err);
+    fail(res, err, "read-document");
   }
 });
 

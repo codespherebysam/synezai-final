@@ -7,6 +7,7 @@ import { register } from "../core/registry.js";
 import { openAICompatible } from "./openai-compatible.js";
 import { gemini } from "./gemini.js";
 import { huggingface } from "./huggingface.js";
+import { pollinations } from "./pollinations.js";
 import { serper, wikipedia } from "./serper.js";
 import { elevenlabs, openaiSpeech, systemVoice } from "./speech.js";
 
@@ -67,6 +68,7 @@ export function registerProviders() {
 
   // ---- Image ----
   register(huggingface);
+  register(pollinations); // keyless last-resort fallback
 
   // ---- Search ----
   register(serper);
