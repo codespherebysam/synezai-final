@@ -11,14 +11,28 @@ const R = {
   code: /\b(code|function|component|bug|error|refactor|typescript|javascript|python|react|jsx|api|sql|algorithm|regex|debug|stack trace)\b|```/i,
   compare: /\b(compare|comparison|difference|differences|diff|versus|vs\.?)\b/i,
   research: /\b(research|deep dive|analyz|report on|pros and cons)\b/i,
+  explicit:
+    /\b(search( the)?( web| online| internet| google)?|google (it|this)|look (it )?up|browse|web ?search|check online|cite sources)\b/i,
+  product:
+    /\b(iphone|ipad|macbook|galaxy|pixel|oneplus|xiaomi|redmi|playstation|ps5|xbox|rtx|snapdragon|tesla)\b/i,
+  latest: /\b(latest|newest|current|most recent|new model)\b/i,
 };
+
+/** True when a question genuinely needs live data (never for uploads). */
+export function needsLive(prompt = "") {
+  if (R.explicit.test(prompt)) return true;
+  if (R.live.test(prompt)) return true;
+  return R.product.test(prompt) && R.latest.test(prompt);
+}
 
 export function detectIntent({ prompt = "", hasImage = false, docCount = 0 } = {}) {
   if (hasImage) return "vision";
   if (docCount >= 2 && R.compare.test(prompt)) return "compare";
+  // Uploaded documents answer from their own text, never from the web.
+  if (docCount) return R.code.test(prompt) ? "code" : "summarize";
   if (R.image.test(prompt)) return "image";
   if (R.website.test(prompt)) return "website";
-  if (R.live.test(prompt)) return "search";
+  if (needsLive(prompt)) return "search";
   if (R.research.test(prompt)) return "research";
   if (R.code.test(prompt)) return "code";
   if (docCount) return "summarize";
@@ -41,6 +55,9 @@ export function planFor(intent) {
 }
 
 export const PERSONAS = {
+  document:
+    "DOCUMENT MODE: the user's uploaded document text is in the context. Answer strictly from it, quote the " +
+    "relevant lines, never treat the filename as the question, never search the web, and never list sources.",
   base:
     "You are SYNEZ AI — a warm, precise, senior assistant with strong reasoning. Lead with the answer, " +
     "then the reasoning. Use markdown. Cite supplied live context as [1], [2]. Never invent time-sensitive " +
@@ -64,6 +81,7 @@ export function personaFor(intent) {
   if (intent === "website") return `${PERSONAS.base}\n\n${PERSONAS.website}`;
   if (intent === "vision") return `${PERSONAS.base}\n\n${PERSONAS.vision}`;
   if (intent === "compare") return `${PERSONAS.base}\n\n${PERSONAS.compare}`;
+  if (intent === "summarize") return `${PERSONAS.base}\n\n${PERSONAS.document}`;
   return PERSONAS.base;
 }
 

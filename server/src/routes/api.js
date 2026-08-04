@@ -60,22 +60,40 @@ api.get("/providers", (_req, res) =>
 /** One endpoint that picks the whole pipeline automatically. */
 api.post("/orchestrate", async (req, res) => {
   try {
-    const { prompt = "", message, sessionId, documents = [], preferred = [] } = req.body ?? {};
+    const {
+      prompt = "",
+      message,
+      sessionId,
+      documents = [],
+      preferred = [],
+      system,
+      context: clientContext,
+      allowSearch,
+      hasAttachments = false,
+    } = req.body ?? {};
     const text = prompt || message || "";
     const images = collectImages(req.body ?? {});
+    const attached = hasAttachments || images.length > 0 || documents.length > 0;
     const intent = detectIntent({
       prompt: text,
       hasImage: images.length > 0,
       docCount: documents.length,
     });
     const plan = planFor(intent);
+    // Uploaded files are the source of truth: never search the web for them.
+    // Otherwise honour the client's explicit decision when it sends one.
+    const shouldSearch = attached
+      ? false
+      : typeof allowSearch === "boolean"
+        ? allowSearch
+        : plan.search;
 
     if (plan.capability === "image") {
       const out = await run("image", { prompt: text }, { preferred });
       return res.json({ intent, provider: out.provider, images: out.images });
     }
 
-    const { context, sources } = plan.search
+    const { context, sources } = shouldSearch
       ? await groundedContext(text)
       : { context: "", sources: [] };
 
@@ -87,8 +105,8 @@ api.post("/orchestrate", async (req, res) => {
 
     const messages = buildMessages({
       sessionId,
-      system: personaFor(intent),
-      context: [nowContext(), context, docContext].filter(Boolean).join("\n\n"),
+      system: system || personaFor(intent),
+      context: [nowContext(), clientContext, context, docContext].filter(Boolean).join("\n\n"),
       messages: req.body.messages,
       prompt: text,
     });
@@ -109,7 +127,13 @@ api.post("/orchestrate", async (req, res) => {
       { role: "assistant", content: out.content },
     ]);
 
-    res.json({ intent, provider: out.provider, model: out.model, content: out.content, sources });
+    res.json({
+      intent,
+      provider: out.provider,
+      model: out.model,
+      content: out.content,
+      sources: shouldSearch ? sources : [],
+    });
   } catch (err) {
     fail(res, err, "orchestrate");
   }
