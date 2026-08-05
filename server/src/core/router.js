@@ -4,6 +4,8 @@
  * Purely capability based: it never names a specific vendor.
  */
 
+import { identityClause } from "../services/identity.js";
+
 const R = {
   live: /\b(latest|today|tonight|current|currently|now|recent|live|price|stock|crypto|exchange rate|score|match|result|standings|news|headline|breaking|weather|temperature|forecast|aqi|who won|release date|near me|trending|20(2[4-9]|3\d))\b/i,
   image: /\b(generate|create|make|draw|design|render)\b.{0,20}\b(image|picture|photo|logo|illustration|poster|wallpaper|art)\b/i,
@@ -59,7 +61,7 @@ export const PERSONAS = {
     "DOCUMENT MODE: the user's uploaded document text is in the context. Answer strictly from it, quote the " +
     "relevant lines, never treat the filename as the question, never search the web, and never list sources.",
   base:
-    "You are SYNEZ AI — a warm, precise, senior assistant with strong reasoning. Lead with the answer, " +
+    "You are the assistant — a warm, precise, senior assistant with strong reasoning. Lead with the answer, " +
     "then the reasoning. Use markdown. Cite supplied live context as [1], [2]. Never invent time-sensitive " +
     "facts; if live context is missing for such a question, say the lookup failed. Address the user by name.",
   code:
@@ -77,6 +79,10 @@ export const PERSONAS = {
 };
 
 export function personaFor(intent) {
+  return `${identityClause()}\n\n${basePersonaFor(intent)}`;
+}
+
+function basePersonaFor(intent) {
   if (intent === "code") return `${PERSONAS.base}\n\n${PERSONAS.code}`;
   if (intent === "website") return `${PERSONAS.base}\n\n${PERSONAS.website}`;
   if (intent === "vision") return `${PERSONAS.base}\n\n${PERSONAS.vision}`;

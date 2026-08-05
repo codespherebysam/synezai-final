@@ -8,6 +8,8 @@ import { detectIntent, planFor, personaFor, nowContext } from "../core/router.js
 import { extractText } from "../services/documents.js";
 import { groundedContext } from "../services/grounding.js";
 import { log, explain } from "../core/log.js";
+import { identityInfo } from "../services/identity.js";
+import { resolveUid, assertImageQuota, consumeImageQuota, DAILY_IMAGE_LIMIT } from "../services/quota.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 export const api = Router();
@@ -17,6 +19,14 @@ const fail = (res, err, scope = "api") => {
   const message = explain(err);
   res.status(err?.status ?? 500).json({ error: message, message, attempts: err?.attempts });
 };
+
+/** Uploaded image files (multipart/form-data) → base64 data URLs. */
+function filesToDataUrls(req) {
+  const files = req.files ?? (req.file ? [req.file] : []);
+  return files
+    .filter((f) => (f.mimetype ?? "").startsWith("image/") && f.buffer?.length)
+    .map((f) => `data:${f.mimetype};base64,${f.buffer.toString("base64")}`);
+}
 
 /** Accept every image field shape the clients send. */
 function collectImages(body = {}) {
@@ -41,8 +51,17 @@ function collectImages(body = {}) {
 /* ------------------------------- health ------------------------------- */
 
 api.get("/health", (_req, res) =>
-  res.json({ ok: true, service: "synezai-backend", version: "2.0.0", time: new Date().toISOString() }),
+  res.json({
+    ok: true,
+    service: "synezai-backend",
+    version: "2.0.0",
+    ...identityInfo(),
+    dailyImageLimit: DAILY_IMAGE_LIMIT,
+    time: new Date().toISOString(),
+  }),
 );
+
+api.get("/identity", (_req, res) => res.json(identityInfo()));
 
 api.get("/providers", (_req, res) =>
   res.json({
@@ -58,7 +77,7 @@ api.get("/providers", (_req, res) =>
 
 /* ------------------------------ orchestrate ---------------------------- */
 /** One endpoint that picks the whole pipeline automatically. */
-api.post("/orchestrate", async (req, res) => {
+api.post("/orchestrate", upload.any(), async (req, res) => {
   try {
     const {
       prompt = "",
@@ -72,7 +91,7 @@ api.post("/orchestrate", async (req, res) => {
       hasAttachments = false,
     } = req.body ?? {};
     const text = prompt || message || "";
-    const images = collectImages(req.body ?? {});
+    const images = [...filesToDataUrls(req), ...collectImages(req.body ?? {})];
     const attached = hasAttachments || images.length > 0 || documents.length > 0;
     const intent = detectIntent({
       prompt: text,
@@ -204,16 +223,19 @@ api.post("/chat-stream", async (req, res) => {
 
 /* -------------------------------- vision ------------------------------- */
 
-api.post("/vision", async (req, res) => {
+api.post("/vision", upload.any(), async (req, res) => {
   try {
     const body = req.body ?? {};
     const prompt = body.prompt || body.message || body.question || "Analyse this image.";
-    const { sessionId, preferred = [] } = body;
-    const images = collectImages(body);
+    const { sessionId } = body;
+    const preferred = Array.isArray(body.preferred) ? body.preferred : [];
+    // Real uploaded bytes take priority over anything referenced by name.
+    const images = [...filesToDataUrls(req), ...collectImages(body)];
     if (!images.length)
       return res.status(400).json({ error: "No image received. Send images[] as data URLs or https URLs." });
     log.info("vision", `analysing ${images.length} image(s)`);
-    const messages = buildMessages({ sessionId, system: personaFor("vision"), prompt });
+    const system = typeof body.system === "string" && body.system.trim() ? body.system : personaFor("vision");
+    const messages = buildMessages({ sessionId, system, prompt });
     messages[messages.length - 1].content = [
       { type: "text", text: prompt },
       ...images.map((url) => ({ type: "image_url", image_url: { url } })),
@@ -231,10 +253,22 @@ const imageHandler = async (req, res) => {
   try {
     const prompt = req.body?.prompt ?? req.body?.text ?? req.query?.prompt;
     if (!prompt) return res.status(400).json({ error: "prompt is required" });
+
+    // Backend-only daily quota, keyed by the Firebase UID (cannot be bypassed
+    // from the client: the frontend never decides whether a call is allowed).
+    const uid = await resolveUid(req);
+    const quota = await assertImageQuota(uid);
+
     log.info("image", `generating: ${String(prompt).slice(0, 120)}`);
     const out = await run("image", { prompt }, { preferred: req.body?.preferred ?? [] });
     if (!out.images?.length) throw new Error("Image provider returned no image data.");
+    const usage = quota.enforced
+      ? await consumeImageQuota(uid)
+      : { limit: DAILY_IMAGE_LIMIT, used: 0, remaining: DAILY_IMAGE_LIMIT, enforced: false };
     res.json({
+      quota: usage,
+      remaining: usage.remaining,
+      limit: usage.limit,
       images: out.images,
       image: out.images[0],
       url: out.images[0],

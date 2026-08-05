@@ -32,3 +32,18 @@ Multi-key pools rotate round-robin; 429/401 keys cool down automatically.
 
 ## Render
 Build `npm install`, start `npm start`. Node >= 18.17.
+
+## New environment variables
+
+```
+APP_NAME=SYNEZ AI
+APP_CREATOR=Sameer Khan
+DAILY_IMAGE_LIMIT=3
+# Firestore quota storage (optional — falls back to in-memory when absent)
+FIREBASE_SERVICE_ACCOUNT={"project_id":"chatbot-d73e2", ...}   # raw JSON or base64
+FIREBASE_PROJECT_ID=chatbot-d73e2
+IMAGE_QUOTA_COLLECTION=image_quota
+```
+
+- `/generate-image` enforces 3 images per Firebase UID per UTC day and returns `{ quota: { limit, used, remaining } }`.
+- `/vision` and `/orchestrate` accept multipart/form-data image uploads (real bytes) as well as base64 data URLs.
